@@ -100,7 +100,7 @@ macOS has different automation APIs (Accessibility API) that would require a com
 
 ```powershell
 # Clone the repository
-git clone https://github.com/yourusername/chatgpt-escalation-mcp.git
+git clone https://github.com/Dazlarus/chatgpt-escalation-mcp.git
 cd chatgpt-escalation-mcp
 
 # Install Node.js dependencies
