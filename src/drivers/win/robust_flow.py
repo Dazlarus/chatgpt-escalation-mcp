@@ -389,21 +389,82 @@ class RobustChatGPTFlow:
         log_debug(f"STEP 5: Clicking project '{project_name}'...")
         
         result = self._find_and_click_sidebar_item(project_name, timeout)
-        
+
         if result:
-            # Verify by checking window title
+            # Verify by checking window title (best-effort)
             time.sleep(0.5)
             title = win32gui.GetWindowText(self.hwnd)
             if project_name.lower() in title.lower():
                 log_debug(f"  ✓ VERIFIED: Window title is '{title}'")
                 return True
-            else:
-                # Title might not change for project click, that's OK
-                log_debug(f"  ✓ Click completed (title: '{title}')")
+
+            # Title may not change; validate via hover detection + OCR nearest text
+            if self._verify_sidebar_selection(project_name):
+                log_debug("  ✓ VERIFIED: Hover/OCR matches intended project")
                 return True
+
+            log_debug("  ✗ FAILED: Post-click validation did not match intended project")
+            return False
         
         log_debug(f"  ✗ FAILED: Could not find/click '{project_name}'")
         return False
+
+    def _verify_sidebar_selection(self, target: str) -> bool:
+        """Verify the currently highlighted sidebar item text matches target using OCR + hover detection."""
+        from hover_detection import detect_highlighted_item
+        from ocr_extraction import get_ocr
+        from fuzzy_match import similarity_ratio
+        from PIL import ImageGrab
+        try:
+            hi = detect_highlighted_item(self.hwnd)
+        except Exception:
+            hi = None
+        if not hi:
+            return False
+        rect = self.window_rect
+        if not rect:
+            return False
+        window_width = rect[2] - rect[0]
+        sidebar_width = int(window_width * 0.28)
+        sidebar_left = rect[0]
+        sidebar_top = rect[1] + 80
+        sidebar_bottom = rect[3] - 50
+        sidebar_right = rect[0] + sidebar_width
+        try:
+            screenshot = ImageGrab.grab(bbox=(sidebar_left, sidebar_top, sidebar_right, sidebar_bottom))
+        except Exception:
+            return False
+        import tempfile, os
+        ocr = get_ocr()
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            temp_path = f.name
+            screenshot.save(temp_path)
+        try:
+            results = ocr.predict(temp_path)
+        finally:
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
+        # Pick text nearest to highlighted y
+        highlight_y = hi['screen_coords'][1]
+        best_text = None
+        best_dist = 1e9
+        for res in results:
+            if 'rec_texts' not in res or 'rec_boxes' not in res:
+                continue
+            texts = res['rec_texts']
+            boxes = res['rec_boxes']
+            for text, box in zip(texts, boxes):
+                box_center_y = sidebar_top + (box[1] + box[3]) / 2
+                dist = abs(box_center_y - highlight_y)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_text = text
+        if not best_text:
+            return False
+        match_score = similarity_ratio(target.lower(), best_text.lower())
+        return match_score >= 0.7 or (target.lower() in best_text.lower())
     
     # =========================================================================
     # STEP 6: Click Conversation
@@ -460,6 +521,7 @@ class RobustChatGPTFlow:
         OCRs the entire sidebar at once and clicks directly on the target.
         """
         import win32api
+        import win32gui
         from pywinauto.mouse import click
         from PIL import ImageGrab
         import tempfile
@@ -467,6 +529,7 @@ class RobustChatGPTFlow:
         
         from ocr_extraction import get_ocr
         from fuzzy_match import similarity_ratio
+        from hover_detection import detect_highlighted_item
         
         ocr = get_ocr()
         rect = self.window_rect
@@ -528,7 +591,34 @@ class RobustChatGPTFlow:
                             except Exception:
                                 pass
                             click(coords=(click_x, click_y))
-                            time.sleep(0.5)
+                            time.sleep(0.35)
+
+                            # Post-click validation: ensure the highlighted row matches intended target.
+                            try:
+                                hi = detect_highlighted_item(self.hwnd)
+                            except Exception as _e:
+                                hi = None
+
+                            if hi and 'screen_coords' in hi:
+                                highlighted_y = hi['screen_coords'][1]
+                                # If highlight is more than ~18px away from the clicked center, we likely selected a neighbor
+                                if abs(highlighted_y - click_y) > 18:
+                                    log_debug(f"  ⚠ Highlight at y={highlighted_y} differs from click_y={click_y} — applying corrective click")
+                                    # Try clicking one row up or down depending on where highlight landed
+                                    # Sidebar row height is ~35px; use 28px as conservative step
+                                    step = 28
+                                    try:
+                                        win32gui.SetForegroundWindow(self.hwnd)
+                                    except Exception:
+                                        pass
+                                    if highlighted_y > click_y:
+                                        # Selected below target; click above
+                                        click(coords=(click_x, click_y - step))
+                                    else:
+                                        # Selected above target; click below
+                                        click(coords=(click_x, click_y + step))
+                                    time.sleep(0.3)
+
                             return True
                 
             except Exception as e:

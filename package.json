@@ -13,6 +13,7 @@
     "test": "node dist/bin/cli.js test",
     "doctor": "node dist/bin/cli.js doctor",
     "init": "node dist/bin/cli.js init",
+    "probe": "node tools/mcp_protocol_probe.js",
     "prepublishOnly": "npm run build",
     "setup-python": "pip install pywinauto pyperclip"
   },
