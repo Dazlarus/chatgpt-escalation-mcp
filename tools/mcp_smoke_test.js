@@ -26,11 +26,11 @@ async function run() {
     console.log('Connected to server');
 
     // List tools
-    const tools = await client.listTools({});
+    const tools = await client.listTools({}, { timeout: 600000 });
     console.log('Tools:', tools.tools.map(t => t.name));
 
     // Call list_projects
-    const listProjectsResult = await client.callTool({ name: 'list_projects', params: {} });
+    const listProjectsResult = await client.callTool({ name: 'list_projects', params: {} }, undefined, { timeout: 600000 });
     console.log('list_projects result:', listProjectsResult);
 
     // If default project exists, test escalate_to_expert in raw mode by sending test.
@@ -45,7 +45,7 @@ async function run() {
             reason: 'smoke test',
             question: 'Please confirm the escalation test is working (reply OK).',
           },
-        });
+        }, undefined, { timeout: 600000 });
         console.log('escalate_to_expert result:', escalateResult);
       } catch (err) {
         console.error('escalate_to_expert error (expected if conv not found):', err.message || err);

@@ -160,7 +160,7 @@ Paste this configuration:
 {
   "chatgpt": {
     "platform": "win",
-    "responseTimeout": 120000,
+    "responseTimeout": 600000,
     "projects": {
       "default": {
         "folder": "Agent Expert Help",

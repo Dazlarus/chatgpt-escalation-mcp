@@ -2,7 +2,7 @@
   "chatgpt": {
     "userDataDir": "",
     "headless": true,
-    "timeout": 120000,
+    "timeout": 600000,
     "projects": {
       "global": ""
     }

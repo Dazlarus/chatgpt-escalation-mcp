@@ -40,7 +40,8 @@ function loadDefaultConfig(): AppConfig {
   return {
     chatgpt: {
       platform: detectPlatform(),
-      responseTimeout: 120000,
+      // Default to 10 minutes to accommodate long, complex responses
+      responseTimeout: 600000,
       projects: {},
     },
     logging: {
@@ -161,8 +162,8 @@ export function validateConfig(config: AppConfig): ConfigValidationResult {
     }
 
     // Check timeout
-    if (config.chatgpt.responseTimeout && config.chatgpt.responseTimeout < 30000) {
-      warnings.push("Timeout is very low (< 30s), ChatGPT responses may take longer");
+    if (config.chatgpt.responseTimeout && config.chatgpt.responseTimeout < 60000) {
+      warnings.push("Timeout is very low (< 60s), ChatGPT responses may take longer");
     }
   }
 

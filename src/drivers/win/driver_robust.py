@@ -156,7 +156,7 @@ class RobustDriver:
         self._last_prompt = message
         return {"success": True}
     
-    def wait_for_response(self, timeout_ms: int = 120000) -> dict:
+    def wait_for_response(self, timeout_ms: int = 600000) -> dict:
         """Wait for ChatGPT to finish generating."""
         timeout_sec = timeout_ms / 1000.0
         
@@ -180,7 +180,7 @@ class RobustDriver:
         }
     
     # Convenience method: full escalation in one call
-    def escalate(self, project_name: str, conversation: str, message: str, timeout_ms: int = 120000) -> dict:
+    def escalate(self, project_name: str, conversation: str, message: str, timeout_ms: int = 600000) -> dict:
         """
         Full escalation flow in one call.
         
@@ -275,7 +275,7 @@ def main():
         result = driver.send_message(params.get("message", ""))
     
     elif action == "wait_for_response":
-        result = driver.wait_for_response(params.get("timeout_ms", 120000))
+        result = driver.wait_for_response(params.get("timeout_ms", 600000))
     
     elif action == "get_last_response":
         result = driver.get_last_response()
@@ -286,7 +286,7 @@ def main():
             project_name=params.get("project_name"),
             conversation=params.get("conversation"),
             message=params.get("message", ""),
-            timeout_ms=params.get("timeout_ms", 120000)
+            timeout_ms=params.get("timeout_ms", 600000)
         )
     
     else:

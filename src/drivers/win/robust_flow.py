@@ -600,6 +600,32 @@ class RobustChatGPTFlow:
         log_debug("STEP 7: Focusing text input...")
         
         rect = self.window_rect
+        import win32gui
+
+        # If rect is None, attempt to refresh from hwnd
+        if rect is None and self.hwnd:
+            try:
+                rect = win32gui.GetWindowRect(self.hwnd)
+                self.window_rect = rect
+            except Exception as e:
+                log_debug(f"  Failed to get window rect from hwnd: {e}")
+                rect = None
+
+        if rect is None:
+            # If we still don't have a rect, try to find a new hwnd and rect
+            new_hwnd = self._find_chatgpt_hwnd()
+            if new_hwnd:
+                self.hwnd = new_hwnd
+                try:
+                    rect = win32gui.GetWindowRect(new_hwnd)
+                    self.window_rect = rect
+                except Exception:
+                    rect = None
+
+        if rect is None:
+            log_debug("  ✗ FAILED: No window rect available to click input")
+            return False
+
         window_width = rect[2] - rect[0]
         window_height = rect[3] - rect[1]
         
