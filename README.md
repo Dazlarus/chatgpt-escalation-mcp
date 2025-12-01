@@ -176,13 +176,13 @@ Paste this configuration:
 
 ### Step 4: Add to Your MCP Client
 
-**For VS Code with GitHub Copilot** (settings.json or mcp config):
+**For VS Code with GitHub Copilot** (`%APPDATA%\Code\User\mcp.json`):
 ```json
 {
-  "mcpServers": {
+  "servers": {
     "chatgpt-escalation": {
       "command": "node",
-      "args": ["C:/path/to/chatgpt-escalation-mcp/dist/src/server.js"]
+      "args": ["N://AI Projects//chatgpt-escalation-mcp//dist//src//server.js"]
     }
   }
 }
@@ -194,13 +194,13 @@ Paste this configuration:
   "mcpServers": {
     "chatgpt-escalation": {
       "command": "node",
-      "args": ["C:/path/to/chatgpt-escalation-mcp/dist/src/server.js"]
+      "args": ["C://path//to//chatgpt-escalation-mcp//dist//src//server.js"]
     }
   }
 }
 ```
 
-> ⚠️ Use forward slashes `/` in paths, or escape backslashes as `\\`
+> ⚠️ Use double forward slashes `//` in paths for JSON, or escape backslashes as `\\\\`
 
 ### Step 5: Teach Your Agent When to Escalate
 
@@ -455,7 +455,31 @@ Discover available project IDs from your configuration. Call this first if you d
 
 For best results, start each project's ChatGPT conversation with a system prompt that establishes the expert role:
 
-> "You are an expert software architect helping with [PROJECT_NAME]. When I send questions, provide detailed technical answers with code examples when appropriate."
+> You are the dedicated expert escalation endpoint for autonomous coding agents working on this project.  
+>  
+> Your role:  
+> - Provide clear, technically correct, implementation-ready guidance.  
+> - Assume the agent will immediately act on your instructions.  
+> - Avoid asking the agent follow-up questions unless absolutely necessary.  
+> - Be concise, direct, and practical.  
+>  
+> Response Format:  
+> 1. Begin with a brief explanation of the issue and the recommended solution.  
+> 2. End every response with a strict JSON object in the following format:  
+>  
+> {  
+>   "guidance": "one-sentence summary of what the agent should do next",  
+>  "action_plan": ["step 1", "step 2", "step 3"],  
+>  "priority": "low | medium | high",  
+>  "notes_for_darien": "optional message for the human"  
+> }  
+>  
+> Important Rules:  
+> - The JSON must be the final content in your message.  
+> - Do NOT wrap the JSON in code fences.  
+> - Do NOT include any commentary after the JSON.  
+> - Do NOT use placeholders or incomplete structures.  
+> - Always return syntactically valid JSON.  
 
 ### During Use
 
