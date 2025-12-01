@@ -462,9 +462,12 @@ class RobustChatGPTFlow:
                     best_dist = dist
                     best_text = text
         if not best_text:
+            log_debug(f"  [verify] No OCR text found near highlight")
             return False
         match_score = similarity_ratio(target.lower(), best_text.lower())
-        return match_score >= 0.7 or (target.lower() in best_text.lower())
+        matched = match_score >= 0.7 or (target.lower() in best_text.lower())
+        log_debug(f"  [verify] Best text='{best_text[:40]}', match_score={match_score:.2f}, matched={matched}")
+        return matched
     
     # =========================================================================
     # STEP 6: Click Conversation
@@ -601,9 +604,10 @@ class RobustChatGPTFlow:
 
                             if hi and 'screen_coords' in hi:
                                 highlighted_y = hi['screen_coords'][1]
+                                delta_y = highlighted_y - click_y
                                 # If highlight is more than ~18px away from the clicked center, we likely selected a neighbor
-                                if abs(highlighted_y - click_y) > 18:
-                                    log_debug(f"  ⚠ Highlight at y={highlighted_y} differs from click_y={click_y} — applying corrective click")
+                                if abs(delta_y) > 18:
+                                    log_debug(f"  ⚠ CORRECTION NEEDED: Highlight at y={highlighted_y}, click was y={click_y}, delta={delta_y}px")
                                     # Try clicking one row up or down depending on where highlight landed
                                     # Sidebar row height is ~35px; use 28px as conservative step
                                     step = 28
@@ -611,13 +615,14 @@ class RobustChatGPTFlow:
                                         win32gui.SetForegroundWindow(self.hwnd)
                                     except Exception:
                                         pass
-                                    if highlighted_y > click_y:
-                                        # Selected below target; click above
-                                        click(coords=(click_x, click_y - step))
-                                    else:
-                                        # Selected above target; click below
-                                        click(coords=(click_x, click_y + step))
+                                    corrective_y = click_y - step if delta_y > 0 else click_y + step
+                                    direction = "above" if delta_y > 0 else "below"
+                                    log_debug(f"  Applying corrective click {step}px {direction} original (y={corrective_y})")
+                                    click(coords=(click_x, corrective_y))
                                     time.sleep(0.3)
+                                    log_debug(f"  ✓ Corrective click completed for target '{target}'")
+                                else:
+                                    log_debug(f"  ✓ Highlight aligned (delta={delta_y}px, within threshold)")
 
                             return True
                 
