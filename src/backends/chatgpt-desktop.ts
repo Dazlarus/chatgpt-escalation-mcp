@@ -47,13 +47,15 @@ function getDriverPath(platform: "win" | "mac"): string {
   const scriptName = platform === "win" ? "driver_robust.py" : "driver.scpt";
   
   const possiblePaths = [
-    // From package root (when running via npx or npm)
+    // From package root (when running via npx or npm or from dist/bin/cli.js)
     path.join(process.cwd(), "src", "drivers", platform, scriptName),
     path.join(process.cwd(), "drivers", platform, scriptName),
+    // From compiled dist/ when running as dist/bin/cli.js or dist/src/server.js
+    path.join(__dirname, "..", "..", "src", "drivers", platform, scriptName),
+    path.join(__dirname, "..", "..", "..", "src", "drivers", platform, scriptName),
     // From node_modules installation
     path.join(__dirname, "..", "drivers", platform, scriptName),
     path.join(__dirname, "..", "..", "drivers", platform, scriptName),
-    path.join(__dirname, "..", "..", "src", "drivers", platform, scriptName),
   ];
 
   for (const p of possiblePaths) {
