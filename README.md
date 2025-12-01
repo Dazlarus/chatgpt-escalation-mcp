@@ -500,77 +500,15 @@ If a ChatGPT update breaks automation, [open an issue](../../issues) with your v
 
 ## What Happens During Escalation
 
-When your agent calls `escalate_to_expert`, here's the full sequence:
+When your agent calls `escalate_to_expert`, the server launches ChatGPT fresh, navigates to the configured conversation, sends the question, waits for completion, copies the response, and returns structured JSON — matching the high‑level flow diagram above. Typical time: **30–120 seconds**.
 
-```
-1. 🔄 Kill ChatGPT          → Ensures clean state (no stale modals)
-2. 🚀 Launch ChatGPT        → Fresh start via shell
-3. 🎯 Focus Window          → Bring to foreground
-4. 📂 Open Sidebar          → Click hamburger menu (if not already open)
-5. 📁 Click Project Folder  → OCR finds folder name, clicks it
-6. 💬 Click Conversation    → OCR finds conversation name, clicks it
-7. ✏️  Focus Input           → Click the text input area
-8. 📋 Send Question         → Paste question + press Enter
-9. ⏳ Wait for Response     → Poll until stop button disappears
-10. 📄 Copy Response        → Navigate to copy button, click it
-11. ✅ Return to Agent      → JSON response sent via MCP
-```
+For implementation details (pixel detection, OCR, copy logic), see `docs/internals-detection.md` and `docs/sidebar-selection.md`.
 
-Total time: **30-120 seconds** depending on response length.
+## Detection Internals
 
-### Automation Behavior Summary
-
-| Behavior | Description |
-|----------|-------------|
-| **On escalation** | ChatGPT Desktop is closed and relaunched fresh |
-| **Window positioning** | Brought to foreground, not moved |
-| **Conversation selection** | Fuzzy match on title in sidebar (OCR-based) |
-| **Sending message** | Pasted into composer → Enter |
-| **Completion detection** | Pixel analysis of stop button region |
-| **Copying response** | Keyboard navigation to copy button |
-| **Returned format** | JSON with response text |
-
-> 💡 **Why restart ChatGPT each time?** This ensures a deterministic window state. ChatGPT Desktop can get into weird states (modals open, input focused wrong, scroll position off) that break automation. A fresh start is more reliable than handling every edge case.
-
-## How Detection Works
-
-This section explains the pixel-based detection for developers who want to understand or modify the automation.
-
-### Sidebar State Detection
-```
-┌─────────────────────────────────┐
-│ [X]  ← X button appears here   │
-│      when sidebar is open      │
-│                                │
-│  Sidebar content...            │
-└─────────────────────────────────┘
-```
-- Samples a 20x20 pixel region where the X button should be
-- Counts pixels darker than brightness threshold (100)
-- **>50 dark pixels** = sidebar is open
-- **<50 dark pixels** = sidebar is closed
-
-### Response Generation Detection
-```
-┌─────────────────────────────────┐
-│                                │
-│  Response text...              │
-│                                │
-│           [■ Stop]  ← Stop     │
-│                       button   │
-└─────────────────────────────────┘
-```
-- Samples the stop button region
-- Counts non-white pixels in the area
-- **60 < pixels < 400** = currently generating (stop button visible)
-- **Outside range** = generation complete
-- Polls every 500ms until complete
-
-### Copy Button Detection
-- After response completes, uses Shift+Tab to navigate backwards
-- Skips first 4 positions (thumbs up/down, regenerate, etc.)
-- At each position: presses Enter, checks if clipboard changed
-- Stops when new content appears in clipboard
+Looking for the low‑level heuristics (sidebar state, response generation, copy button)? They’re documented for contributors in:
+- `docs/internals-detection.md`
+- `docs/sidebar-selection.md`
 
 ## Development
 
