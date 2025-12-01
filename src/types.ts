@@ -36,7 +36,7 @@ export interface ExpertResponse {
   guidance: string;
   action_plan: string[];
   priority: Priority;
-  notes_for_darien?: string;
+  notes_for_user?: string;
 }
 
 // ============================================================================
@@ -106,7 +106,8 @@ export interface DriverCommand {
     | "send_message"
     | "wait_for_response"
     | "get_last_response"
-    | "focus_chatgpt";
+    | "focus_chatgpt"
+    | "escalate";
   params?: Record<string, unknown>;
 }
 

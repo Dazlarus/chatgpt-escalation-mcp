@@ -38,6 +38,8 @@ class RobustChatGPTFlow:
     def __init__(self):
         self.hwnd = None
         self.window_rect = None
+        # Allow test harness to disable keyboard fallbacks to avoid global Tab usage in CI
+        self._keyboard_fallback_enabled = True
     
     # =========================================================================
     # STEP 1: Kill ChatGPT
@@ -59,6 +61,7 @@ class RobustChatGPTFlow:
             try:
                 if proc.info['name'] and proc.info['name'].lower() == "chatgpt.exe":
                     log_debug(f"  Terminating PID {proc.info['pid']}")
+        
                     proc.terminate()
                     killed = True
             except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -79,13 +82,13 @@ class RobustChatGPTFlow:
                         break
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
-            
+
             if not still_running:
                 log_debug("  ✓ VERIFIED: ChatGPT process terminated")
                 return True
-            
+
             time.sleep(0.3)
-        
+
         log_debug("  ✗ FAILED: ChatGPT still running after timeout")
         return False
     
@@ -157,8 +160,39 @@ class RobustChatGPTFlow:
                     pass
             return True
         
-        win32gui.EnumWindows(callback, None)
+        try:
+            win32gui.EnumWindows(callback, None)
+        except Exception as e:
+            # EnumWindows failed (permission or runtime issue); try fallback method
+            log_debug(f"  EnumWindows failed: {e} - trying psutil + pywinauto fallback")
+            # Call a smaller fallback routine to avoid nested try/except confusion
+            try:
+                return self._find_chatgpt_hwnd_fallback(psutil)
+            except Exception as e2:
+                log_debug(f"  Fallback via pywinauto failed: {e2}")
+            # If fallback failed, return whatever we have (likely None)
+            return result[0]
         return result[0]
+
+    def _find_chatgpt_hwnd_fallback(self, psutil_module):
+        """Fallback: use psutil + pywinauto to find a top window for chatgpt.exe"""
+        from pywinauto import Application
+
+        for proc in psutil_module.process_iter(['name', 'pid']):
+            try:
+                if proc.info['name'] and proc.info['name'].lower() == 'chatgpt.exe':
+                    pid = proc.info['pid']
+                    try:
+                        app = Application(backend='uia').connect(process=pid)
+                        top = app.top_window()
+                        hwnd = top.handle
+                        if hwnd:
+                            return hwnd
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        return None
     
     # =========================================================================
     # STEP 3: Focus ChatGPT
@@ -218,6 +252,39 @@ class RobustChatGPTFlow:
             except Exception as e:
                 log_debug(f"  Focus attempt {attempt} failed: {e}")
             
+            # If we're still not foreground, attempt UIA set_focus or title bar click as a last-resort
+            try:
+                from pywinauto import Application
+                app = Application(backend='uia').connect(handle=self.hwnd)
+                top = app.top_window()
+                try:
+                    top.set_focus()
+                    time.sleep(0.25)
+                    if win32gui.GetForegroundWindow() == self.hwnd:
+                        self.window_rect = win32gui.GetWindowRect(self.hwnd)
+                        log_debug(f"  ✓ VERIFIED: ChatGPT is foreground after UIA set_focus (attempt {attempt})")
+                        return True
+                except Exception:
+                    # Fallthrough to click title bar
+                    pass
+            except Exception:
+                pass
+
+            # Click title-bar center as a fallback to force focus
+            try:
+                rect = win32gui.GetWindowRect(self.hwnd)
+                title_click_x = rect[0] + 40
+                title_click_y = rect[1] + 10
+                from pywinauto.mouse import click
+                click(coords=(title_click_x, title_click_y))
+                time.sleep(0.25)
+                if win32gui.GetForegroundWindow() == self.hwnd:
+                    self.window_rect = win32gui.GetWindowRect(self.hwnd)
+                    log_debug(f"  ✓ VERIFIED: ChatGPT is foreground after title click (attempt {attempt})")
+                    return True
+            except Exception:
+                pass
+
             time.sleep(0.3)
         
         log_debug("  ✗ FAILED: Could not focus window after timeout")
@@ -256,6 +323,11 @@ class RobustChatGPTFlow:
         menu_y = rect[1] + 70
         
         log_debug(f"  Clicking hamburger at ({menu_x}, {menu_y})")
+        try:
+            import win32gui
+            win32gui.SetForegroundWindow(self.hwnd)
+        except Exception:
+            pass
         click(coords=(menu_x, menu_y))
         
         # VERIFY: Wait for sidebar to appear
@@ -450,6 +522,11 @@ class RobustChatGPTFlow:
                             click_x = int(sidebar_left + box_center_x)
                             click_y = int(sidebar_top + box_center_y)
                             
+                            try:
+                                import win32gui
+                                win32gui.SetForegroundWindow(self.hwnd)
+                            except Exception:
+                                pass
                             click(coords=(click_x, click_y))
                             time.sleep(0.5)
                             return True
@@ -536,6 +613,11 @@ class RobustChatGPTFlow:
                         click_y = int(content_top + box_center_y)
                         
                         log_debug(f"    Clicking at ({click_x}, {click_y})")
+                        try:
+                            import win32gui
+                            win32gui.SetForegroundWindow(self.hwnd)
+                        except Exception:
+                            pass
                         click(coords=(click_x, click_y))
                         return True
                     else:
@@ -586,33 +668,71 @@ class RobustChatGPTFlow:
         scroll(coords=(sidebar_x, sidebar_y), wheel_dist=wheel_dist)
     
     # =========================================================================
-    # STEP 7: Focus Text Input
+    # STEP 7: Focus Text Input (now split into focus + send helpers)
     # =========================================================================
-    
-    def step7_focus_input(self) -> bool:
+
+    def _is_edit_focused(self) -> bool:
+        """Return True if current UIA focused control is an Edit/Document/Text element."""
+        try:
+            # Use Windows UIA directly via comtypes to get the focused element
+            import comtypes.client
+            UIAutomationCore = comtypes.client.GetModule("UIAutomationCore.dll")
+            from comtypes.gen.UIAutomationClient import CUIAutomation, IUIAutomation
+            
+            uia = comtypes.client.CreateObject(CUIAutomation)
+            focused = uia.GetFocusedElement()
+            if not focused:
+                log_debug("[focus] _is_edit_focused: no focused element")
+                return False
+            
+            ctype_id = focused.CurrentControlType
+            name = focused.CurrentName or ''
+            class_name = focused.CurrentClassName or ''
+            
+            # Control type IDs: Edit=50004, Document=50030, Text=50020, Custom=50025, Group=50026
+            type_names = {50004: 'Edit', 50030: 'Document', 50020: 'Text', 50025: 'Custom', 50026: 'Group'}
+            ctype_name = type_names.get(ctype_id, f'Unknown({ctype_id})')
+            log_debug(f"[focus] focused element: type={ctype_name}, name={name[:50]!r}, class={class_name!r}")
+            
+            # Accept Edit, Document, or Group (Chrome renders input as Group sometimes)
+            # Also accept if class is Chrome_RenderWidgetHostHWND (the Electron/Chrome input surface)
+            if ctype_id in (50004, 50030):
+                return True
+            if ctype_id == 50026 and class_name == 'Chrome_RenderWidgetHostHWND':
+                return True
+            return False
+        except Exception as e:
+            log_debug(f"[focus] _is_edit_focused error: {e}")
+            return False
+
+    def ensure_input_focus(self) -> bool:
         """
-        Focus the chat text input box.
-        
-        Verification: Difficult - we just click and hope.
+        Focus the text input without typing.
+        Strategy (in order): direct click grid, UIA Edit search, calibration variance,
+        guarded minimal Tab traversal.
+        Returns True once an editable control is focused.
         """
         from pywinauto.mouse import click
-        
-        log_debug("STEP 7: Focusing text input...")
-        
-        rect = self.window_rect
         import win32gui
 
-        # If rect is None, attempt to refresh from hwnd
+        log_debug("[focus] ensure_input_focus start")
+
+        if not self.hwnd:
+            log_debug("[focus] ✗ FAILED: No hwnd")
+            return False
+
+        rect = self.window_rect
+        # Refresh rect if missing
         if rect is None and self.hwnd:
             try:
                 rect = win32gui.GetWindowRect(self.hwnd)
                 self.window_rect = rect
             except Exception as e:
-                log_debug(f"  Failed to get window rect from hwnd: {e}")
+                log_debug(f"[focus] Failed to refresh window rect: {e}")
                 rect = None
 
         if rect is None:
-            # If we still don't have a rect, try to find a new hwnd and rect
+            # Try to rediscover window
             new_hwnd = self._find_chatgpt_hwnd()
             if new_hwnd:
                 self.hwnd = new_hwnd
@@ -621,53 +741,208 @@ class RobustChatGPTFlow:
                     self.window_rect = rect
                 except Exception:
                     rect = None
-
         if rect is None:
-            log_debug("  ✗ FAILED: No window rect available to click input")
+            log_debug("[focus] ✗ FAILED: No window rect")
             return False
+
+        # Check if already focused
+        if self._is_edit_focused():
+            log_debug("[focus] already focused on edit/document — skipping strategies")
+            return True
 
         window_width = rect[2] - rect[0]
         window_height = rect[3] - rect[1]
-        
-        # Input box is at roughly 83% down from top, centered horizontally
         input_x = rect[0] + int(window_width * 0.5)
         input_y = rect[1] + int(window_height * 0.83)
-        
-        click(coords=(input_x, input_y))
-        time.sleep(0.3)
-        
-        log_debug(f"  ✓ Clicked input at ({input_x}, {input_y})")
-        return True
+        log_debug(f"[focus] window rect: {rect}, input target: ({input_x}, {input_y})")
+
+        # Strategy 1: Grid clicks
+        log_debug("[focus] trying strategy: grid_click")
+        offsets = [0, -10, 10, -20, 20]
+        for ox in offsets:
+            for oy in offsets:
+                try:
+                    win32gui.SetForegroundWindow(self.hwnd)
+                except Exception:
+                    pass
+                try:
+                    click(coords=(input_x + ox, input_y + oy))
+                except Exception as e:
+                    log_debug(f"[focus] grid click error at offset ({ox},{oy}): {e}")
+                time.sleep(0.15)
+                if self._is_edit_focused():
+                    log_debug("[focus] ✓ success via grid_click")
+                    return True
+        log_debug("[focus] grid_click did not yield edit focus")
+
+        # Strategy 2: UIA Edit fallback
+        log_debug("[focus] trying strategy: uia_edit")
+        try:
+            from pywinauto import Application
+            app = Application(backend='uia').connect(handle=self.hwnd)
+            main_win = app.window(handle=self.hwnd)
+            edits = main_win.descendants(control_type='Edit')
+            log_debug(f"[focus] UIA found {len(edits)} Edit controls")
+            if edits:
+                edits[0].set_focus()
+                time.sleep(0.25)
+                if self._is_edit_focused():
+                    log_debug("[focus] ✓ success via uia_edit")
+                    return True
+                else:
+                    log_debug("[focus] uia_edit set_focus did not yield edit focus")
+            else:
+                log_debug("[focus] no Edit controls found via UIA")
+        except Exception as e:
+            log_debug(f"[focus] uia_edit failed: {e}")
+
+        # Strategy 3: Calibration variance heuristic
+        log_debug("[focus] trying strategy: variance_click")
+        try:
+            from PIL import ImageGrab
+            import numpy as np
+            width = rect[2] - rect[0]
+            height = rect[3] - rect[1]
+            band_top = rect[1] + int(height * 0.80)
+            band_bottom = rect[1] + int(height * 0.86)
+            band_left = rect[0] + int(width * 0.15)
+            band_right = rect[0] + int(width * 0.85)
+            img = ImageGrab.grab(bbox=(band_left, band_top, band_right, band_bottom))
+            arr = np.array(img)
+            col_var = arr.var(axis=(0, 2))
+            if len(col_var) > 0:
+                peak_x_offset = int(np.argmax(col_var))
+                focus_x = band_left + peak_x_offset
+                focus_y = band_top + (band_bottom - band_top) // 2
+                log_debug(f"[focus] variance peak at x_offset={peak_x_offset}, clicking ({focus_x}, {focus_y})")
+                try:
+                    win32gui.SetForegroundWindow(self.hwnd)
+                except Exception:
+                    pass
+                click(coords=(focus_x, focus_y))
+                time.sleep(0.25)
+                if self._is_edit_focused():
+                    log_debug("[focus] ✓ success via variance_click")
+                    return True
+                else:
+                    log_debug("[focus] variance_click did not yield edit focus")
+            else:
+                log_debug("[focus] variance array empty")
+        except Exception as e:
+            log_debug(f"[focus] variance_click failed: {e}")
+
+        # Strategy 4: Guarded minimal Tab traversal
+        log_debug("[focus] trying strategy: tab_traversal")
+        try:
+            if not self._is_edit_focused() and self._keyboard_fallback_enabled:
+                from pywinauto.keyboard import send_keys
+                for i in range(3):
+                    try:
+                        win32gui.SetForegroundWindow(self.hwnd)
+                    except Exception:
+                        pass
+                    send_keys('{TAB}')
+                    time.sleep(0.12)
+                    if self._is_edit_focused():
+                        log_debug(f"[focus] ✓ success via tab_traversal (Tab #{i+1})")
+                        return True
+                # Final direct click after tabs
+                log_debug("[focus] tab_traversal: 3 tabs done, trying final click")
+                try:
+                    win32gui.SetForegroundWindow(self.hwnd)
+                except Exception:
+                    pass
+                click(coords=(input_x, input_y))
+                time.sleep(0.2)
+                if self._is_edit_focused():
+                    log_debug("[focus] ✓ success via tab_traversal + final click")
+                    return True
+                else:
+                    log_debug("[focus] tab_traversal + final click did not yield edit focus")
+            else:
+                log_debug("[focus] tab_traversal skipped (already focused or disabled)")
+        except Exception as e:
+            log_debug(f"[focus] tab_traversal failed: {e}")
+
+        # Final check
+        if self._is_edit_focused():
+            log_debug("[focus] ✓ focused after all strategies (late detection)")
+            return True
+        log_debug("[focus] ✗ FAILED: could not focus input after all strategies")
+        return False
+
+    def step7_send_prompt(self, prompt: str) -> bool:
+        """Focus input (ensure_input_focus) then readiness probe and send prompt."""
+        log_debug("STEP 7+8: Focus & Send Prompt...")
+        from pywinauto.mouse import click
+        import win32gui
+        if not self.ensure_input_focus():
+            return False
+        # Determine input center for re-clicks
+        rect = self.window_rect
+        if not rect:
+            return False
+        window_width = rect[2] - rect[0]
+        window_height = rect[3] - rect[1]
+        input_x = rect[0] + int(window_width * 0.5)
+        input_y = rect[1] + int(window_height * 0.83)
+
+        import pyperclip
+        from pywinauto.keyboard import send_keys
+        try:
+            previous_clipboard = pyperclip.paste()
+        except Exception:
+            previous_clipboard = None
+
+        max_attempts = 8
+        for attempt in range(max_attempts):
+            log_debug(f"  Probe attempt {attempt+1}/{max_attempts} (Ctrl+C)")
+            try:
+                win32gui.SetForegroundWindow(self.hwnd)
+            except Exception:
+                pass
+            try:
+                send_keys('^c')
+            except Exception as e:
+                log_debug(f"   Ctrl+C failed: {e}")
+            time.sleep(0.12)
+            try:
+                if not self._is_generating():
+                    log_debug("  Idle (arrow) detected — sending prompt")
+                    pyperclip.copy(prompt)
+                    time.sleep(0.06)
+                    send_keys('^v')
+                    time.sleep(0.12)
+                    send_keys('{ENTER}')
+                    time.sleep(0.4)
+                    if previous_clipboard is not None:
+                        try:
+                            pyperclip.copy(previous_clipboard)
+                        except Exception:
+                            pass
+                    log_debug("  ✓ Prompt sent")
+                    return True
+            except Exception:
+                pass
+            # Re-click input before retry
+            try:
+                click(coords=(input_x, input_y))
+                time.sleep(0.2)
+            except Exception:
+                pass
+
+        if previous_clipboard is not None:
+            try:
+                pyperclip.copy(previous_clipboard)
+            except Exception:
+                pass
+        log_debug("  ✗ FAILED: Prompt not sent after readiness attempts")
+        return False
     
     # =========================================================================
     # STEP 8: Send Prompt
     # =========================================================================
     
-    def step8_send_prompt(self, prompt: str) -> bool:
-        """
-        Type and send the prompt.
-        
-        Verification: We'll verify in the wait step.
-        """
-        import pyperclip
-        from pywinauto.keyboard import send_keys
-        
-        log_debug("STEP 8: Sending prompt...")
-        log_debug(f"  Prompt: '{prompt[:50]}...'")
-        
-        # Paste prompt
-        pyperclip.copy(prompt)
-        time.sleep(0.1)
-        
-        send_keys("^v")
-        time.sleep(0.3)
-        
-        # Press Enter to send
-        send_keys("{ENTER}")
-        time.sleep(0.5)
-        
-        log_debug("  ✓ Prompt sent")
-        return True
     
     # =========================================================================
     # STEP 9: Wait for Response
@@ -762,69 +1037,157 @@ class RobustChatGPTFlow:
         Copy the last response to clipboard.
         
         Strategy:
-        1. Focus input (anchor point)
-        2. Shift+Tab 5 times first (skip dangerous buttons like thumbs down)
-        3. Then try Enter and check clipboard
-        4. If no content, continue Shift+Tab and retry
-        
-        Toolbar order (right to left from input):
-        - "..." (more actions) 
-        - Refresh
-        - Thumbs down (DANGER - opens feedback popup)
-        - Thumbs up  
-        - Copy (this is what we want)
+        1. Click input area as anchor point
+        2. Shift+Tab × 5 to reach Copy button (toolbar order from input: +attach, mic, voice, ..., refresh, thumbs-down, thumbs-up, copy)
+        3. Validate focused element is Copy button before pressing Enter
+        4. If not on Copy, continue Shift+Tab with validation
+        5. Fallback to UIA direct invoke
         """
         import pyperclip
         from pywinauto.keyboard import send_keys
+        from pywinauto.mouse import click
+        import win32gui
         
         log_debug("STEP 10: Copying response...")
         
-        # Focus input first (anchor point)
-        self.step7_focus_input()
-        time.sleep(0.3)
+        # Helper to get focused element info via UIA
+        def get_focused_button_name() -> str:
+            """Return name of focused button, or empty string if not a button."""
+            try:
+                import comtypes.client
+                UIAutomationCore = comtypes.client.GetModule("UIAutomationCore.dll")
+                from comtypes.gen.UIAutomationClient import CUIAutomation
+                
+                uia = comtypes.client.CreateObject(CUIAutomation)
+                focused = uia.GetFocusedElement()
+                if not focused:
+                    return ""
+                
+                ctype_id = focused.CurrentControlType
+                name = focused.CurrentName or ''
+                
+                # Button = 50000
+                if ctype_id == 50000:
+                    log_debug(f"[copy] Focused button: {name!r}")
+                    return name.lower()
+                else:
+                    log_debug(f"[copy] Focused element type={ctype_id}, name={name[:30]!r}")
+                    return ""
+            except Exception as e:
+                log_debug(f"[copy] get_focused_button_name error: {e}")
+                return ""
         
-        # Skip first 4 buttons (they're not Copy and some are dangerous)
-        # Tab 4 times without pressing Enter
-        for i in range(4):
+        # Simple click on input area as anchor
+        rect = self.window_rect
+        if rect:
+            window_width = rect[2] - rect[0]
+            window_height = rect[3] - rect[1]
+            input_x = rect[0] + int(window_width * 0.5)
+            input_y = rect[1] + int(window_height * 0.83)
+            try:
+                win32gui.SetForegroundWindow(self.hwnd)
+            except Exception:
+                pass
+            try:
+                click(coords=(input_x, input_y))
+                time.sleep(0.3)
+                log_debug(f"[copy] Clicked anchor at ({input_x}, {input_y})")
+            except Exception as e:
+                log_debug(f"[copy] Anchor click failed: {e}")
+        
+        # Strategy 1: Shift+Tab × 5 to reach Copy, then validate and Enter
+        log_debug("[copy] Navigating with Shift+Tab × 5...")
+        try:
+            win32gui.SetForegroundWindow(self.hwnd)
+        except Exception:
+            pass
+        
+        # Do 5 Shift+Tabs to reach Copy button area
+        for i in range(5):
             send_keys("+{TAB}")
-            time.sleep(0.1)
+            time.sleep(0.08)
         
-        # Now try Enter after each additional Shift+Tab
-        max_additional_tabs = 8  # Safety limit
+        time.sleep(0.15)  # Let UI settle
         
-        for i in range(max_additional_tabs):
-            send_keys("+{TAB}")
-            time.sleep(0.15)
-            
-            # Clear clipboard and try Enter
+        # Check what we landed on
+        btn_name = get_focused_button_name()
+        
+        if 'copy' in btn_name:
+            log_debug(f"[copy] ✓ On Copy button after 5 Shift+Tabs")
             pyperclip.copy("")
             send_keys("{ENTER}")
             time.sleep(0.3)
-            
-            # Check if clipboard now has content
             response = pyperclip.paste()
-            if response and len(response) > 5:  # Expect more than 5 chars for real response
-                log_debug(f"  ✓ Copy button found after {4 + i + 1} total Shift+Tabs, got {len(response)} chars")
+            if response and len(response) > 5:
+                log_debug(f"[copy] ✓ Got {len(response)} chars")
                 return response
-            
-            # No content - close any popup that might have opened
-            send_keys("{VK_ESCAPE}")
+        
+        # Not on Copy — maybe need more tabs. Continue with validation.
+        # Dangerous buttons to avoid: thumbs up, thumbs down, refresh, ...
+        dangerous = ['thumb', 'dislike', 'like', 'refresh', 'regenerate', 'more']
+        
+        max_extra_tabs = 6
+        for i in range(max_extra_tabs):
+            send_keys("+{TAB}")
             time.sleep(0.1)
+            
+            btn_name = get_focused_button_name()
+            
+            if 'copy' in btn_name:
+                log_debug(f"[copy] ✓ Found Copy button after {5 + i + 1} Shift+Tabs")
+                pyperclip.copy("")
+                send_keys("{ENTER}")
+                time.sleep(0.3)
+                response = pyperclip.paste()
+                if response and len(response) > 5:
+                    log_debug(f"[copy] ✓ Got {len(response)} chars")
+                    return response
+            elif any(d in btn_name for d in dangerous):
+                log_debug(f"[copy] Skipping dangerous button: {btn_name}")
+                continue
+            elif btn_name == '':
+                # Not on a button, might have overshot
+                log_debug(f"[copy] Lost button focus, stopping tab navigation")
+                break
         
-        log_debug(f"  Could not find Copy button")
+        # Fallback: Try UIA direct invoke
+        log_debug("[copy] Tab navigation failed, trying UIA direct invoke...")
+        try:
+            from pywinauto import Application
+            app = Application(backend='uia').connect(handle=self.hwnd)
+            main_win = app.window(handle=self.hwnd)
+            buttons = main_win.descendants(control_type='Button')
+            for b in buttons:
+                try:
+                    name = (b.element_info.name or "").lower()
+                    if 'copy' in name:
+                        log_debug(f"[copy] UIA found Copy button: {name} - invoking")
+                        pyperclip.copy("")
+                        try:
+                            b.invoke()
+                        except Exception:
+                            b.click_input()
+                        time.sleep(0.4)
+                        resp = pyperclip.paste()
+                        if resp and len(resp) > 5:
+                            log_debug(f"[copy] ✓ Got {len(resp)} chars via UIA")
+                            return resp
+                except Exception:
+                    continue
+        except Exception as e:
+            log_debug(f"[copy] UIA fallback failed: {e}")
         
-        # Fallback: Try Ctrl+Shift+C (global copy shortcut)
-        log_debug("  Trying Ctrl+Shift+C fallback...")
+        # Last resort: Ctrl+Shift+C
+        log_debug("[copy] Trying Ctrl+Shift+C...")
         pyperclip.copy("")
         send_keys("^+c")
         time.sleep(0.5)
-        
         response = pyperclip.paste()
-        if response:
-            log_debug(f"  ✓ Got {len(response)} chars via Ctrl+Shift+C")
+        if response and len(response) > 5:
+            log_debug(f"[copy] ✓ Got {len(response)} chars via Ctrl+Shift+C")
             return response
         
-        log_debug("  ✗ FAILED: Could not copy response")
+        log_debug("[copy] ✗ FAILED: Could not copy response")
         return ""
     
     # =========================================================================
@@ -883,13 +1246,9 @@ class RobustChatGPTFlow:
         if not self.step6_click_conversation(conversation_name):
             return {"success": False, "error": f"Failed to find conversation '{conversation_name}'", "failed_step": 6}
         
-        # Step 7: Focus Input
-        if not self.step7_focus_input():
-            return {"success": False, "error": "Failed to focus input", "failed_step": 7}
-        
-        # Step 8: Send Prompt
-        if not self.step8_send_prompt(prompt):
-            return {"success": False, "error": "Failed to send prompt", "failed_step": 8}
+        # Step 7+8: Focus & Send Prompt
+        if not self.step7_send_prompt(prompt):
+            return {"success": False, "error": "Failed to focus/send prompt", "failed_step": 7}
         
         # Step 9: Wait for Response
         if not self.step9_wait_for_response():
@@ -953,19 +1312,12 @@ if __name__ == "__main__":
     
     time.sleep(0.5)
     
-    # Test step 7 - Focus input
-    if flow.step7_focus_input():
-        print("Step 7 passed")
-    else:
-        print("Step 7 FAILED")
-        exit(1)
-    
-    # Test step 8 - Send prompt
+    # Test step 7+8 - Focus & Send prompt
     test_prompt = "What are 5 examples of water being used in biology"
-    if flow.step8_send_prompt(test_prompt):
-        print("Step 8 passed")
+    if flow.step7_send_prompt(test_prompt):
+        print("Step 7+8 passed")
     else:
-        print("Step 8 FAILED")
+        print("Step 7+8 FAILED")
         exit(1)
     
     # Test step 9 - Wait for response

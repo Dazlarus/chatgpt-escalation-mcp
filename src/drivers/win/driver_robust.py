@@ -144,15 +144,12 @@ class RobustDriver:
         }
     
     def send_message(self, message: str) -> dict:
-        """Send a message to the current conversation."""
-        # Focus input
-        if not self.flow.step7_focus_input():
-            return {"success": False, "error": "Failed to focus input"}
-        
-        # Send prompt
-        if not self.flow.step8_send_prompt(message):
-            return {"success": False, "error": "Failed to send message"}
-        
+        """Send a message to the current conversation (combined focus+send)."""
+        log_debug(f"[driver] send_message called, len={len(message)}")
+        ok = self.flow.step7_send_prompt(message)
+        log_debug(f"[driver] step7_send_prompt returned: {ok}")
+        if not ok:
+            return {"success": False, "error": "Failed to focus/send message"}
         self._last_prompt = message
         return {"success": True}
     
@@ -213,13 +210,12 @@ class RobustDriver:
         if not self.flow.step6_click_conversation(conversation):
             return {"success": False, "error": f"Failed to find conversation: {conversation}"}
         
-        # Step 7: Focus input
-        if not self.flow.step7_focus_input():
-            return {"success": False, "error": "Failed to focus input"}
-        
-        # Step 8: Send prompt
-        if not self.flow.step8_send_prompt(message):
-            return {"success": False, "error": "Failed to send message"}
+        # Step 7+8: Focus & send prompt (merged)
+        log_debug(f"[driver] escalate calling step7_send_prompt, msg_len={len(message)}")
+        if not self.flow.step7_send_prompt(message):
+            log_debug("[driver] step7_send_prompt FAILED in escalate")
+            return {"success": False, "error": "Failed to focus/send message"}
+        log_debug("[driver] step7_send_prompt succeeded in escalate")
         
         # Step 9: Wait for response
         timeout_sec = timeout_ms / 1000.0

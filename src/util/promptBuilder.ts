@@ -31,14 +31,14 @@ IMPORTANT: You MUST respond ONLY with valid JSON in the following exact format, 
   "guidance": "Your main guidance and explanation here",
   "action_plan": ["Step 1", "Step 2", "Step 3"],
   "priority": "low|medium|high",
-  "notes_for_darien": "Optional notes for the human developer if needed"
+  "notes_for_user": "Optional notes for the human developer if needed"
 }
 
 Rules:
 - "guidance" must be a string with your main advice
 - "action_plan" must be an array of strings, each being a concrete action step
 - "priority" must be exactly one of: "low", "medium", or "high"
-- "notes_for_darien" is optional, include only if there's something the human should know
+- "notes_for_user" is optional, include only if there's something the human should know
 - Do NOT include any text outside the JSON object
 - Do NOT wrap the JSON in markdown code blocks`;
 
@@ -129,8 +129,8 @@ export function validateExpertResponse(obj: unknown): obj is import("../types.js
 
   // Optional field check
   if (
-    response.notes_for_darien !== undefined &&
-    typeof response.notes_for_darien !== "string"
+    response.notes_for_user !== undefined &&
+    typeof response.notes_for_user !== "string"
   ) {
     return false;
   }

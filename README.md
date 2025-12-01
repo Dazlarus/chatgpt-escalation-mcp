@@ -471,7 +471,7 @@ For best results, start each project's ChatGPT conversation with a system prompt
 >   "guidance": "one-sentence summary of what the agent should do next",  
 >  "action_plan": ["step 1", "step 2", "step 3"],  
 >  "priority": "low | medium | high",  
->  "notes_for_darien": "optional message for the human"  
+>  "notes_for_user": "optional message for the human"  
 > }  
 >  
 > Important Rules:  
@@ -711,6 +711,10 @@ pip uninstall pywinauto pyperclip paddleocr paddlepaddle
 ## Security
 
 This tool **never** automates anything outside the ChatGPT Desktop window. It never reads unrelated windows, captures screens of other apps, or interacts with other applications. All automation is scoped to the ChatGPT process.
+
+## Author
+
+Created by **Darien Hardin** ([@Dazlarus](https://github.com/Dazlarus))
 
 ## License
 

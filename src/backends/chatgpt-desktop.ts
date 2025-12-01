@@ -199,62 +199,33 @@ async function sendEscalation(
     }
     logger.debug("ChatGPT Desktop found");
 
-    // Step 2: Focus ChatGPT window
-    const focusResult = await executeDriver(platform, { action: "focus_chatgpt" });
-    if (!focusResult.success) {
-      throw new Error(`Failed to focus ChatGPT: ${focusResult.error}`);
-    }
-    logger.debug("ChatGPT focused");
+    // Build prompt
+    const prompt = buildPrompt(packet);
+    logger.debug("Built prompt", { length: prompt.length });
 
-    // Step 3: Find the project conversation
+    // Run escalate flow in the driver in a single call. This avoids creating multiple ephemeral driver
+    // processes which start/stop ChatGPT repeatedly and cause the UI to be unstable.
     const conversationTitle = getProjectConversation(config, packet.project);
     if (!conversationTitle) {
       throw new Error(`No conversation configured for project: ${packet.project}`);
     }
-
-    // Get optional project folder for vision-based navigation
     const projectFolder = getProjectFolder(config, packet.project);
 
-    const findResult = await executeDriver(platform, {
-      action: "find_conversation",
-      params: { 
-        title: conversationTitle,
-        project_name: projectFolder || undefined  // Pass folder for vision navigation
+    const escalateResult = await executeDriver(platform, {
+      action: "escalate",
+      params: {
+        project_name: projectFolder || undefined,
+        conversation: conversationTitle,
+        message: prompt,
+        timeout_ms: responseTimeout,
       },
     });
-    if (!findResult.success) {
-      throw new Error(`Failed to find conversation "${conversationTitle}": ${findResult.error}`);
+    if (!escalateResult.success) {
+      throw new Error(`Escalation failed: ${escalateResult.error}`);
     }
-    logger.debug("Conversation found", { title: conversationTitle, folder: projectFolder });
+    logger.debug("Escalation completed", { project: packet.project, conversation: conversationTitle });
 
-    // Step 4: Build and send the message
-    const prompt = buildPrompt(packet);
-    logger.debug("Built prompt", { length: prompt.length });
-
-    const sendResult = await executeDriver(platform, {
-      action: "send_message",
-      params: { message: prompt },
-    });
-    if (!sendResult.success) {
-      throw new Error(`Failed to send message: ${sendResult.error}`);
-    }
-    logger.debug("Message sent");
-
-    // Step 5: Wait for response
-    const waitResult = await executeDriver(platform, {
-      action: "wait_for_response",
-      params: { timeout_ms: responseTimeout },
-    });
-    if (!waitResult.success) {
-      throw new Error(`Timeout waiting for response: ${waitResult.error}`);
-    }
-    logger.debug("Response received");
-
-    // Step 6: Get the response
-    const getResult = await executeDriver(platform, { action: "get_last_response" });
-    if (!getResult.success) {
-      throw new Error(`Failed to get response: ${getResult.error}`);
-    }
+    const getResult = escalateResult;
 
     const responseData = getResult.data as { response: string };
     const rawResponse = responseData.response;
