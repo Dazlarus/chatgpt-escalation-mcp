@@ -613,6 +613,25 @@ pip install --upgrade pywinauto pyperclip pywin32
 
 Logs are written to stderr and can be captured by your MCP client. Set `logging.level` to `"debug"` in config for verbose output.
 
+### Common Driver Error: NoneType window rect
+
+If you see an error like:
+
+```
+TypeError: 'NoneType' object is not subscriptable
+```
+
+This typically means the Python driver could not find or access the ChatGPT Desktop window. Try the following:
+
+- Make sure ChatGPT Desktop is open and not minimized
+- Set `headless` to `false` in your config if it is `true` (some environments hide the window)
+- Move ChatGPT Desktop to your primary monitor and ensure it isn't occluded by other apps
+- Confirm the conversation and folder titles match your config exactly
+- Run `npm run doctor` to validate the configuration and dependencies
+- Re-run the MCP smoke-test: `node tools/mcp_smoke_test.js`
+
+If the issue persists, check the backend logs (stdout/stderr) for more details and open an issue with the log snippet and your ChatGPT Desktop version.
+
 ## Verification Checklist
 
 Before your first escalation, confirm:
