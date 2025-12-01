@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.local
+
+# User config (don't commit personal settings)
+.chatgpt-escalation/
+
+# Test coverage
+coverage/
+
+# Local test scripts
+tests/
+
+# Agent instructions (local development notes)
+agents.md
+
+# Temporary files
+*.tmp
+*.temp

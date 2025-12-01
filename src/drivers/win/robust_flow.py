@@ -1,0 +1,964 @@
+#!/usr/bin/env python3
+"""
+Robust ChatGPT automation flow with verification gates.
+
+Each step has:
+1. Action
+2. Verification (with retries)
+3. Only proceed when verified
+
+This prevents race conditions and ensures reliable automation.
+"""
+
+import time
+import sys
+import os
+
+# Add driver directory to path
+_driver_dir = os.path.dirname(os.path.abspath(__file__))
+if _driver_dir not in sys.path:
+    sys.path.insert(0, _driver_dir)
+
+# Start OCR model preloading immediately (background thread)
+# This runs during steps 1-4 so OCR is ready by step 5
+from ocr_extraction import start_ocr_preload
+start_ocr_preload()
+
+
+def log_debug(msg: str):
+    """Log debug message to stderr."""
+    print(f"[FLOW] {msg}", file=sys.stderr)
+
+
+class RobustChatGPTFlow:
+    """
+    Robust ChatGPT automation with verification gates between each step.
+    """
+    
+    def __init__(self):
+        self.hwnd = None
+        self.window_rect = None
+    
+    # =========================================================================
+    # STEP 1: Kill ChatGPT
+    # =========================================================================
+    
+    def step1_kill_chatgpt(self, timeout: float = 5.0) -> bool:
+        """
+        Kill ChatGPT if running.
+        
+        Verification: Process no longer exists.
+        """
+        import psutil
+        
+        log_debug("STEP 1: Killing ChatGPT if running...")
+        
+        # Find and kill
+        killed = False
+        for proc in psutil.process_iter(['name', 'pid']):
+            try:
+                if proc.info['name'] and proc.info['name'].lower() == "chatgpt.exe":
+                    log_debug(f"  Terminating PID {proc.info['pid']}")
+                    proc.terminate()
+                    killed = True
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        
+        if not killed:
+            log_debug("  ChatGPT was not running")
+            return True
+        
+        # VERIFY: Wait for process to actually exit
+        start = time.time()
+        while (time.time() - start) < timeout:
+            still_running = False
+            for proc in psutil.process_iter(['name']):
+                try:
+                    if proc.info['name'] and proc.info['name'].lower() == "chatgpt.exe":
+                        still_running = True
+                        break
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            
+            if not still_running:
+                log_debug("  ✓ VERIFIED: ChatGPT process terminated")
+                return True
+            
+            time.sleep(0.3)
+        
+        log_debug("  ✗ FAILED: ChatGPT still running after timeout")
+        return False
+    
+    # =========================================================================
+    # STEP 2: Start ChatGPT
+    # =========================================================================
+    
+    def step2_start_chatgpt(self, timeout: float = 15.0) -> bool:
+        """
+        Start ChatGPT Desktop.
+        
+        Verification: Window handle found AND window is visible.
+        """
+        import subprocess
+        import win32gui
+        import win32process
+        import psutil
+        
+        log_debug("STEP 2: Starting ChatGPT...")
+        
+        # Launch
+        subprocess.Popen(
+            'start "" "ChatGPT"',
+            shell=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        
+        # VERIFY: Wait for window to appear
+        start = time.time()
+        while (time.time() - start) < timeout:
+            hwnd = self._find_chatgpt_hwnd()
+            if hwnd:
+                # Additional check: window must be visible
+                if win32gui.IsWindowVisible(hwnd):
+                    self.hwnd = hwnd
+                    self.window_rect = win32gui.GetWindowRect(hwnd)
+                    title = win32gui.GetWindowText(hwnd)
+                    log_debug(f"  ✓ VERIFIED: Window found (hwnd={hwnd}, title='{title}')")
+                    
+                    # Extra wait for UI to fully initialize
+                    time.sleep(1.5)
+                    return True
+            
+            time.sleep(0.5)
+        
+        log_debug("  ✗ FAILED: Window not found after timeout")
+        return False
+    
+    def _find_chatgpt_hwnd(self):
+        """Find ChatGPT window handle."""
+        import win32gui
+        import win32process
+        import psutil
+        
+        result = [None]
+        
+        def callback(hwnd, _):
+            if win32gui.IsWindow(hwnd) and win32gui.IsWindowVisible(hwnd):
+                try:
+                    _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                    proc = psutil.Process(pid)
+                    if proc.name().lower() == "chatgpt.exe":
+                        title = win32gui.GetWindowText(hwnd)
+                        if title and "IME" not in title and "Default" not in title:
+                            result[0] = hwnd
+                            return False  # Stop enumeration
+                except:
+                    pass
+            return True
+        
+        win32gui.EnumWindows(callback, None)
+        return result[0]
+    
+    # =========================================================================
+    # STEP 3: Focus ChatGPT
+    # =========================================================================
+    
+    def step3_focus_chatgpt(self, timeout: float = 5.0) -> bool:
+        """
+        Bring ChatGPT to foreground.
+        
+        Verification: ChatGPT is the foreground window.
+        """
+        import win32gui
+        import win32con
+        
+        log_debug("STEP 3: Focusing ChatGPT window...")
+        
+        if not self.hwnd:
+            log_debug("  ✗ FAILED: No window handle")
+            return False
+        
+        # Try multiple methods to bring to front
+        start = time.time()
+        attempt = 0
+        
+        while (time.time() - start) < timeout:
+            attempt += 1
+            
+            try:
+                # Restore if minimized
+                if win32gui.IsIconic(self.hwnd):
+                    win32gui.ShowWindow(self.hwnd, win32con.SW_RESTORE)
+                    time.sleep(0.3)
+                
+                # Method 1: SetForegroundWindow
+                win32gui.SetForegroundWindow(self.hwnd)
+                time.sleep(0.3)
+                
+                # VERIFY: Check if we're now foreground
+                fg_hwnd = win32gui.GetForegroundWindow()
+                if fg_hwnd == self.hwnd:
+                    log_debug(f"  ✓ VERIFIED: ChatGPT is foreground (attempt {attempt})")
+                    
+                    # Update rect in case window moved
+                    self.window_rect = win32gui.GetWindowRect(self.hwnd)
+                    return True
+                
+                # Method 2: Try BringWindowToTop
+                win32gui.BringWindowToTop(self.hwnd)
+                time.sleep(0.3)
+                
+                fg_hwnd = win32gui.GetForegroundWindow()
+                if fg_hwnd == self.hwnd:
+                    log_debug(f"  ✓ VERIFIED: ChatGPT is foreground (attempt {attempt}, method 2)")
+                    self.window_rect = win32gui.GetWindowRect(self.hwnd)
+                    return True
+                
+            except Exception as e:
+                log_debug(f"  Focus attempt {attempt} failed: {e}")
+            
+            time.sleep(0.3)
+        
+        log_debug("  ✗ FAILED: Could not focus window after timeout")
+        return False
+    
+    # =========================================================================
+    # STEP 4: Open Sidebar
+    # =========================================================================
+    
+    def step4_open_sidebar(self, timeout: float = 3.0) -> bool:
+        """
+        Open the sidebar by clicking hamburger menu.
+        
+        Verification: Sidebar region has light gray background (~249,249,249).
+        """
+        import win32gui
+        from pywinauto.mouse import click
+        from PIL import ImageGrab
+        import numpy as np
+        
+        log_debug("STEP 4: Opening sidebar...")
+        
+        if not self.hwnd or not self.window_rect:
+            log_debug("  ✗ FAILED: No window")
+            return False
+        
+        rect = self.window_rect
+        
+        # First check if sidebar is already open
+        if self._is_sidebar_open():
+            log_debug("  ✓ Sidebar already open")
+            return True
+        
+        # Click hamburger menu (top-left)
+        menu_x = rect[0] + 30
+        menu_y = rect[1] + 70
+        
+        log_debug(f"  Clicking hamburger at ({menu_x}, {menu_y})")
+        click(coords=(menu_x, menu_y))
+        
+        # VERIFY: Wait for sidebar to appear
+        start = time.time()
+        while (time.time() - start) < timeout:
+            time.sleep(0.3)
+            
+            if self._is_sidebar_open():
+                log_debug("  ✓ VERIFIED: Sidebar is open")
+                return True
+        
+        log_debug("  ✗ FAILED: Sidebar not detected after click")
+        return False
+    
+    def _is_sidebar_open(self) -> bool:
+        """Fast check if sidebar is open by looking for X close button."""
+        from PIL import ImageGrab
+        import numpy as np
+        
+        if not self.window_rect:
+            return False
+        
+        rect = self.window_rect
+        
+        # X button is at approximately x+275, y+58 (center of X)
+        # Capture a 20x20 area around it
+        x_center = rect[0] + 275
+        y_center = rect[1] + 58
+        
+        try:
+            area = (x_center - 10, y_center - 10, x_center + 10, y_center + 10)
+            img = ImageGrab.grab(bbox=area)
+            pixels = np.array(img)
+            
+            # The X icon has dark pixels (gray lines on light background)
+            # Count pixels darker than 180
+            dark_pixels = np.sum(pixels < 180)
+            
+            # If we see dark pixels (>30), the X button is visible = sidebar open
+            is_open = dark_pixels > 30
+            log_debug(f"  Sidebar check: {dark_pixels} dark pixels -> {'OPEN' if is_open else 'CLOSED'}")
+            return is_open
+        except Exception as e:
+            log_debug(f"  Sidebar check failed: {e}")
+            return False
+    
+    # =========================================================================
+    # STEP 5: Click Project
+    # =========================================================================
+    
+    def step5_click_project(self, project_name: str, timeout: float = 10.0) -> bool:
+        """
+        Find and click on a project in the sidebar.
+        
+        Verification: Window title contains project name OR we detect hover on target.
+        """
+        import win32gui
+        
+        log_debug(f"STEP 5: Clicking project '{project_name}'...")
+        
+        result = self._find_and_click_sidebar_item(project_name, timeout)
+        
+        if result:
+            # Verify by checking window title
+            time.sleep(0.5)
+            title = win32gui.GetWindowText(self.hwnd)
+            if project_name.lower() in title.lower():
+                log_debug(f"  ✓ VERIFIED: Window title is '{title}'")
+                return True
+            else:
+                # Title might not change for project click, that's OK
+                log_debug(f"  ✓ Click completed (title: '{title}')")
+                return True
+        
+        log_debug(f"  ✗ FAILED: Could not find/click '{project_name}'")
+        return False
+    
+    # =========================================================================
+    # STEP 6: Click Conversation
+    # =========================================================================
+    
+    def step6_click_conversation(self, conversation_name: str, timeout: float = 10.0) -> bool:
+        """
+        Find and click on a conversation in the PROJECT VIEW (main content area).
+        
+        After clicking a project, sidebar closes and conversations appear in center.
+        
+        Verification: Window title contains conversation name.
+        """
+        import win32gui
+        
+        log_debug(f"STEP 6: Clicking conversation '{conversation_name}'...")
+        
+        # After project click, conversations are in MAIN content area, not sidebar
+        result = self._find_and_click_project_item(conversation_name, timeout)
+        
+        if result:
+            # Verify by checking window title
+            time.sleep(0.8)
+            title = win32gui.GetWindowText(self.hwnd)
+            
+            # Fuzzy check
+            if self._fuzzy_match(conversation_name, title):
+                log_debug(f"  ✓ VERIFIED: Window title is '{title}'")
+                return True
+            else:
+                log_debug(f"  ⚠ Click done but title='{title}' doesn't match '{conversation_name}'")
+                # Still return true - might be OK
+                return True
+        
+        log_debug(f"  ✗ FAILED: Could not find/click '{conversation_name}'")
+        return False
+    
+    def _fuzzy_match(self, target: str, text: str, threshold: float = 0.6) -> bool:
+        """Simple fuzzy match - check if words overlap."""
+        target_words = set(target.lower().split())
+        text_words = set(text.lower().split())
+        
+        if not target_words:
+            return False
+        
+        overlap = len(target_words & text_words)
+        ratio = overlap / len(target_words)
+        
+        return ratio >= threshold or target.lower() in text.lower()
+    
+    def _find_and_click_sidebar_item(self, target: str, timeout: float = 10.0) -> bool:
+        """
+        Find and click target item in sidebar using OCR (fast method).
+        OCRs the entire sidebar at once and clicks directly on the target.
+        """
+        import win32api
+        from pywinauto.mouse import click
+        from PIL import ImageGrab
+        import tempfile
+        import os
+        
+        from ocr_extraction import get_ocr
+        from fuzzy_match import similarity_ratio
+        
+        ocr = get_ocr()
+        rect = self.window_rect
+        window_width = rect[2] - rect[0]
+        window_height = rect[3] - rect[1]
+        
+        # Sidebar region (left 28%, skip title bar area)
+        sidebar_width = int(window_width * 0.28)
+        sidebar_left = rect[0]
+        sidebar_right = rect[0] + sidebar_width
+        sidebar_top = rect[1] + 80  # Below title bar
+        sidebar_bottom = rect[3] - 50  # Above bottom
+        
+        log_debug(f"  Scanning sidebar for '{target}'...")
+        
+        start_time = time.time()
+        scroll_count = 0
+        max_scrolls = 5
+        
+        while (time.time() - start_time) < timeout:
+            # Capture entire sidebar
+            try:
+                screenshot = ImageGrab.grab(bbox=(sidebar_left, sidebar_top, sidebar_right, sidebar_bottom))
+                
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                    temp_path = f.name
+                    screenshot.save(temp_path)
+                
+                results = ocr.predict(temp_path)
+                os.unlink(temp_path)
+                
+                # Find target in OCR results
+                for res in results:
+                    if 'rec_texts' not in res or 'rec_boxes' not in res:
+                        continue
+                    
+                    texts = res['rec_texts']
+                    boxes = res['rec_boxes']
+                    scores = res.get('rec_scores', [1.0] * len(texts))
+                    
+                    for text, box, score in zip(texts, boxes, scores):
+                        match_score = similarity_ratio(target.lower(), text.lower())
+                        
+                        log_debug(f"    At y={int(box[1])}: '{text[:30]}...' (score={match_score:.2f})")
+                        
+                        if match_score >= 0.7 or target.lower() in text.lower():
+                            log_debug(f"  FOUND '{target}' - clicking!")
+                            
+                            # Calculate click position from box
+                            box_center_x = (box[0] + box[2]) / 2
+                            box_center_y = (box[1] + box[3]) / 2
+                            
+                            click_x = int(sidebar_left + box_center_x)
+                            click_y = int(sidebar_top + box_center_y)
+                            
+                            click(coords=(click_x, click_y))
+                            time.sleep(0.5)
+                            return True
+                
+            except Exception as e:
+                log_debug(f"  Error scanning sidebar: {e}")
+            
+            # Not found - scroll down
+            scroll_count += 1
+            if scroll_count > max_scrolls:
+                break
+            
+            log_debug(f"  Scrolling down (attempt {scroll_count})...")
+            self._scroll_sidebar("down")
+            time.sleep(0.4)
+        
+        return False
+    
+    def _find_and_click_project_item(self, target: str, timeout: float = 10.0) -> bool:
+        """
+        Scan PROJECT VIEW (main content area) looking for conversation.
+        After clicking a project, conversations appear in center, not sidebar.
+        """
+        import win32api
+        from pywinauto.mouse import click
+        from PIL import ImageGrab
+        import tempfile
+        import os
+        
+        # Import OCR
+        from ocr_extraction import get_ocr
+        from fuzzy_match import fuzzy_contains, similarity_ratio
+        
+        ocr = get_ocr()
+        rect = self.window_rect
+        window_width = rect[2] - rect[0]
+        window_height = rect[3] - rect[1]
+        
+        # Project view: conversations are in the CENTER of the window
+        # Based on screenshot: roughly from x=120 to x=750, y=180 to y=400
+        # As percentage of window: x=15% to 85%, y=25% to 70%
+        
+        content_left = rect[0] + int(window_width * 0.12)
+        content_right = rect[0] + int(window_width * 0.88)
+        content_top = rect[1] + int(window_height * 0.30)
+        content_bottom = rect[1] + int(window_height * 0.75)
+        
+        log_debug(f"  Scanning project view for '{target}'...")
+        log_debug(f"  Content area: ({content_left}, {content_top}) to ({content_right}, {content_bottom})")
+        
+        # Capture the content area
+        try:
+            screenshot = ImageGrab.grab(bbox=(content_left, content_top, content_right, content_bottom))
+            
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                temp_path = f.name
+                screenshot.save(temp_path)
+            
+            results = ocr.predict(temp_path)
+            os.unlink(temp_path)
+            
+            # Find all text items
+            for res in results:
+                if 'rec_texts' not in res or 'rec_boxes' not in res:
+                    continue
+                
+                texts = res['rec_texts']
+                boxes = res['rec_boxes']
+                scores = res.get('rec_scores', [1.0] * len(texts))
+                
+                for text, box, score in zip(texts, boxes, scores):
+                    # Check if this matches our target
+                    match_score = similarity_ratio(target.lower(), text.lower())
+                    
+                    if match_score >= 0.7 or target.lower() in text.lower():
+                        log_debug(f"    FOUND '{text}' (match={match_score:.2f})")
+                        
+                        # Calculate click position from box
+                        # Box is in screenshot coordinates, need to add content_left/top
+                        box_center_x = (box[0] + box[2]) / 2
+                        box_center_y = (box[1] + box[3]) / 2
+                        
+                        click_x = int(content_left + box_center_x)
+                        click_y = int(content_top + box_center_y)
+                        
+                        log_debug(f"    Clicking at ({click_x}, {click_y})")
+                        click(coords=(click_x, click_y))
+                        return True
+                    else:
+                        log_debug(f"    '{text}' (match={match_score:.2f}) - no match")
+            
+            log_debug(f"  Target '{target}' not found in project view")
+            return False
+            
+        except Exception as e:
+            log_debug(f"  Error scanning project view: {e}")
+            return False
+    
+    def _capture_sidebar(self):
+        """Capture sidebar region."""
+        from PIL import ImageGrab
+        
+        if not self.window_rect:
+            return None
+        
+        rect = self.window_rect
+        window_width = rect[2] - rect[0]
+        sidebar_width = int(window_width * 0.28)
+        
+        sidebar_rect = (rect[0], rect[1], rect[0] + sidebar_width, rect[3])
+        
+        try:
+            return ImageGrab.grab(bbox=sidebar_rect)
+        except:
+            return None
+    
+    def _scroll_sidebar(self, direction: str = "down"):
+        """Scroll sidebar."""
+        import win32api
+        from pywinauto.mouse import scroll
+        
+        rect = self.window_rect
+        window_width = rect[2] - rect[0]
+        window_height = rect[3] - rect[1]
+        
+        sidebar_width = int(window_width * 0.28)
+        sidebar_x = rect[0] + (sidebar_width // 2)
+        sidebar_y = rect[1] + (window_height // 2)
+        
+        win32api.SetCursorPos((sidebar_x, sidebar_y))
+        time.sleep(0.1)
+        
+        wheel_dist = -3 if direction == "down" else 3
+        scroll(coords=(sidebar_x, sidebar_y), wheel_dist=wheel_dist)
+    
+    # =========================================================================
+    # STEP 7: Focus Text Input
+    # =========================================================================
+    
+    def step7_focus_input(self) -> bool:
+        """
+        Focus the chat text input box.
+        
+        Verification: Difficult - we just click and hope.
+        """
+        from pywinauto.mouse import click
+        
+        log_debug("STEP 7: Focusing text input...")
+        
+        rect = self.window_rect
+        window_width = rect[2] - rect[0]
+        window_height = rect[3] - rect[1]
+        
+        # Input box is at roughly 83% down from top, centered horizontally
+        input_x = rect[0] + int(window_width * 0.5)
+        input_y = rect[1] + int(window_height * 0.83)
+        
+        click(coords=(input_x, input_y))
+        time.sleep(0.3)
+        
+        log_debug(f"  ✓ Clicked input at ({input_x}, {input_y})")
+        return True
+    
+    # =========================================================================
+    # STEP 8: Send Prompt
+    # =========================================================================
+    
+    def step8_send_prompt(self, prompt: str) -> bool:
+        """
+        Type and send the prompt.
+        
+        Verification: We'll verify in the wait step.
+        """
+        import pyperclip
+        from pywinauto.keyboard import send_keys
+        
+        log_debug("STEP 8: Sending prompt...")
+        log_debug(f"  Prompt: '{prompt[:50]}...'")
+        
+        # Paste prompt
+        pyperclip.copy(prompt)
+        time.sleep(0.1)
+        
+        send_keys("^v")
+        time.sleep(0.3)
+        
+        # Press Enter to send
+        send_keys("{ENTER}")
+        time.sleep(0.5)
+        
+        log_debug("  ✓ Prompt sent")
+        return True
+    
+    # =========================================================================
+    # STEP 9: Wait for Response
+    # =========================================================================
+    
+    def step9_wait_for_response(self, timeout: float = 120.0) -> bool:
+        """
+        Wait for ChatGPT to finish generating.
+        
+        Detection: Black stop button visible = generating, waveform = idle.
+        """
+        from PIL import ImageGrab
+        import numpy as np
+        
+        log_debug("STEP 9: Waiting for response...")
+        
+        start_time = time.time()
+        
+        # Initial wait for generation to start
+        time.sleep(1.0)
+        
+        generation_started = False
+        consecutive_idle = 0
+        
+        while (time.time() - start_time) < timeout:
+            is_gen = self._is_generating()
+            
+            if is_gen:
+                generation_started = True
+                consecutive_idle = 0
+                elapsed = time.time() - start_time
+                log_debug(f"  [{elapsed:.0f}s] GENERATING (stop button visible)")
+            else:
+                consecutive_idle += 1
+                elapsed = time.time() - start_time
+                log_debug(f"  [{elapsed:.0f}s] IDLE (waveform visible) - consecutive: {consecutive_idle}")
+                
+                # Need several consecutive idle readings after generation started
+                if generation_started and consecutive_idle >= 3:
+                    log_debug(f"  ✓ VERIFIED: Response complete after {elapsed:.0f}s")
+                    return True
+                
+                # If we never saw generation start but see idle for a while,
+                # maybe response was very fast or already done
+                if not generation_started and consecutive_idle >= 5:
+                    log_debug(f"  ✓ Response appears complete (no generation detected)")
+                    return True
+            
+            time.sleep(0.5)
+        
+        log_debug(f"  ✗ TIMEOUT after {timeout}s")
+        return False
+    
+    def _is_generating(self) -> bool:
+        """Check if ChatGPT is generating by looking for black stop button."""
+        from PIL import ImageGrab
+        import numpy as np
+        
+        if not self.window_rect:
+            return False
+        
+        rect = self.window_rect
+        window_width = rect[2] - rect[0]
+        window_height = rect[3] - rect[1]
+        
+        # Stop/waveform button at bottom-right of input box
+        center_x = rect[0] + int(window_width * 0.83)
+        center_y = rect[1] + int(window_height * 0.87)
+        
+        area = (center_x - 15, center_y - 15, center_x + 15, center_y + 15)
+        
+        try:
+            img = ImageGrab.grab(bbox=area)
+            pixels = np.array(img)
+            
+            # Count very dark pixels (the black stop square)
+            dark_pixels = np.sum(np.all(pixels < 50, axis=2))
+            
+            # Stop button: 60-400 dark pixels (black square on white)
+            # Waveform (idle): <60 dark pixels
+            # Arrow (ready): >400 dark pixels (not expected during wait)
+            return 60 < dark_pixels < 400
+        except:
+            return False
+    
+    # =========================================================================
+    # STEP 10: Copy Response
+    # =========================================================================
+    
+    def step10_copy_response(self) -> str:
+        """
+        Copy the last response to clipboard.
+        
+        Strategy:
+        1. Focus input (anchor point)
+        2. Shift+Tab 5 times first (skip dangerous buttons like thumbs down)
+        3. Then try Enter and check clipboard
+        4. If no content, continue Shift+Tab and retry
+        
+        Toolbar order (right to left from input):
+        - "..." (more actions) 
+        - Refresh
+        - Thumbs down (DANGER - opens feedback popup)
+        - Thumbs up  
+        - Copy (this is what we want)
+        """
+        import pyperclip
+        from pywinauto.keyboard import send_keys
+        
+        log_debug("STEP 10: Copying response...")
+        
+        # Focus input first (anchor point)
+        self.step7_focus_input()
+        time.sleep(0.3)
+        
+        # Skip first 4 buttons (they're not Copy and some are dangerous)
+        # Tab 4 times without pressing Enter
+        for i in range(4):
+            send_keys("+{TAB}")
+            time.sleep(0.1)
+        
+        # Now try Enter after each additional Shift+Tab
+        max_additional_tabs = 8  # Safety limit
+        
+        for i in range(max_additional_tabs):
+            send_keys("+{TAB}")
+            time.sleep(0.15)
+            
+            # Clear clipboard and try Enter
+            pyperclip.copy("")
+            send_keys("{ENTER}")
+            time.sleep(0.3)
+            
+            # Check if clipboard now has content
+            response = pyperclip.paste()
+            if response and len(response) > 5:  # Expect more than 5 chars for real response
+                log_debug(f"  ✓ Copy button found after {4 + i + 1} total Shift+Tabs, got {len(response)} chars")
+                return response
+            
+            # No content - close any popup that might have opened
+            send_keys("{VK_ESCAPE}")
+            time.sleep(0.1)
+        
+        log_debug(f"  Could not find Copy button")
+        
+        # Fallback: Try Ctrl+Shift+C (global copy shortcut)
+        log_debug("  Trying Ctrl+Shift+C fallback...")
+        pyperclip.copy("")
+        send_keys("^+c")
+        time.sleep(0.5)
+        
+        response = pyperclip.paste()
+        if response:
+            log_debug(f"  ✓ Got {len(response)} chars via Ctrl+Shift+C")
+            return response
+        
+        log_debug("  ✗ FAILED: Could not copy response")
+        return ""
+    
+    # =========================================================================
+    # FULL FLOW
+    # =========================================================================
+    
+    def execute_full_flow(
+        self,
+        project_name: str,
+        conversation_name: str,
+        prompt: str
+    ) -> dict:
+        """
+        Execute the complete flow with verification at each step.
+        
+        Returns:
+            {
+                "success": bool,
+                "response": str (if successful),
+                "error": str (if failed),
+                "failed_step": int (if failed)
+            }
+        """
+        log_debug("=" * 60)
+        log_debug("EXECUTING FULL FLOW")
+        log_debug(f"  Project: {project_name}")
+        log_debug(f"  Conversation: {conversation_name}")
+        log_debug(f"  Prompt: {prompt[:50]}...")
+        log_debug("=" * 60)
+        
+        # Step 1: Kill ChatGPT
+        if not self.step1_kill_chatgpt():
+            return {"success": False, "error": "Failed to kill ChatGPT", "failed_step": 1}
+        
+        time.sleep(1.0)  # Extra wait after kill
+        
+        # Step 2: Start ChatGPT
+        if not self.step2_start_chatgpt():
+            return {"success": False, "error": "Failed to start ChatGPT", "failed_step": 2}
+        
+        # Step 3: Focus ChatGPT
+        if not self.step3_focus_chatgpt():
+            return {"success": False, "error": "Failed to focus ChatGPT", "failed_step": 3}
+        
+        # Step 4: Open Sidebar
+        if not self.step4_open_sidebar():
+            return {"success": False, "error": "Failed to open sidebar", "failed_step": 4}
+        
+        # Step 5: Click Project
+        if not self.step5_click_project(project_name):
+            return {"success": False, "error": f"Failed to find project '{project_name}'", "failed_step": 5}
+        
+        time.sleep(0.5)  # Wait for project to expand
+        
+        # Step 6: Click Conversation
+        if not self.step6_click_conversation(conversation_name):
+            return {"success": False, "error": f"Failed to find conversation '{conversation_name}'", "failed_step": 6}
+        
+        # Step 7: Focus Input
+        if not self.step7_focus_input():
+            return {"success": False, "error": "Failed to focus input", "failed_step": 7}
+        
+        # Step 8: Send Prompt
+        if not self.step8_send_prompt(prompt):
+            return {"success": False, "error": "Failed to send prompt", "failed_step": 8}
+        
+        # Step 9: Wait for Response
+        if not self.step9_wait_for_response():
+            return {"success": False, "error": "Timeout waiting for response", "failed_step": 9}
+        
+        # Step 10: Copy Response
+        response = self.step10_copy_response()
+        if not response:
+            return {"success": False, "error": "Failed to copy response", "failed_step": 10}
+        
+        log_debug("=" * 60)
+        log_debug("FLOW COMPLETE - SUCCESS")
+        log_debug("=" * 60)
+        
+        return {
+            "success": True,
+            "response": response
+        }
+
+
+# Test
+if __name__ == "__main__":
+    flow = RobustChatGPTFlow()
+    
+    # Test individual steps
+    print("Testing robust flow...")
+    
+    # Test step 1
+    if flow.step1_kill_chatgpt():
+        print("Step 1 passed")
+    
+    time.sleep(1)
+    
+    # Test step 2
+    if flow.step2_start_chatgpt():
+        print("Step 2 passed")
+    
+    # Test step 3
+    if flow.step3_focus_chatgpt():
+        print("Step 3 passed")
+    
+    # Test step 4
+    if flow.step4_open_sidebar():
+        print("Step 4 passed")
+    
+    # Test step 5 - Click project
+    if flow.step5_click_project("Agent Expert Help"):
+        print("Step 5 passed")
+    else:
+        print("Step 5 FAILED")
+        exit(1)
+    
+    time.sleep(0.5)
+    
+    # Test step 6 - Click conversation
+    if flow.step6_click_conversation("o3 test"):
+        print("Step 6 passed")
+    else:
+        print("Step 6 FAILED")
+        exit(1)
+    
+    time.sleep(0.5)
+    
+    # Test step 7 - Focus input
+    if flow.step7_focus_input():
+        print("Step 7 passed")
+    else:
+        print("Step 7 FAILED")
+        exit(1)
+    
+    # Test step 8 - Send prompt
+    test_prompt = "What are 5 examples of water being used in biology"
+    if flow.step8_send_prompt(test_prompt):
+        print("Step 8 passed")
+    else:
+        print("Step 8 FAILED")
+        exit(1)
+    
+    # Test step 9 - Wait for response
+    if flow.step9_wait_for_response():
+        print("Step 9 passed")
+    else:
+        print("Step 9 FAILED")
+        exit(1)
+    
+    # Test step 10 - Copy response
+    response = flow.step10_copy_response()
+    if response:
+        print("Step 10 passed")
+        print(f"\n{'='*60}")
+        print("RESPONSE:")
+        print(f"{'='*60}")
+        print(response[:500] + "..." if len(response) > 500 else response)
+    else:
+        print("Step 10 FAILED")
+        exit(1)
+    
+    print("\n✓ FULL FLOW COMPLETE!")

@@ -1,0 +1,14 @@
+{
+  "chatgpt": {
+    "userDataDir": "",
+    "headless": true,
+    "timeout": 120000,
+    "projects": {
+      "global": ""
+    }
+  },
+  "logging": {
+    "level": "info",
+    "file": ""
+  }
+}
