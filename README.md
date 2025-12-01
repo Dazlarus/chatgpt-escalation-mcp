@@ -724,3 +724,8 @@ MIT
 
 See [CHANGELOG.md](CHANGELOG.md) for version history.
 
+## Additional Docs
+
+- Protocol probe usage and troubleshooting: `docs/protocol-probe.md`
+- Sidebar selection internals and tuning: `docs/sidebar-selection.md`
+
