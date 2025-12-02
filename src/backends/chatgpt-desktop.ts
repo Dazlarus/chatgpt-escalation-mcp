@@ -241,7 +241,11 @@ async function sendEscalation(
     const { platform, responseTimeout } = config.chatgpt;
     const maxTemplateRetries = 2;  // Retry up to 2 times if template detected
     
+    // Generate unique run ID for this escalation (for observability)
+    const runId = `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    
     logger.info("Sending escalation via ChatGPT Desktop", {
+      runId,
       project: packet.project,
       platform,
     });
@@ -282,6 +286,7 @@ async function sendEscalation(
       const escalateResult = await executeDriver(platform, {
         action: "escalate",
         params: {
+          run_id: runId,
           project_name: projectFolder || undefined,
           conversation: conversationTitle,
           message: messageToSend,
@@ -289,9 +294,17 @@ async function sendEscalation(
         },
       });
       if (!escalateResult.success) {
+        // Include runId in error for correlation
+        const errorData = escalateResult as { error?: string; failed_step?: number; error_reason?: string };
+        logger.error("Escalation failed", {
+          runId,
+          error: errorData.error,
+          failedStep: errorData.failed_step,
+          errorReason: errorData.error_reason,
+        });
         throw new Error(`Escalation failed: ${escalateResult.error}`);
       }
-      logger.debug("Escalation completed", { project: packet.project, conversation: conversationTitle, attempt });
+      logger.debug("Escalation completed", { runId, project: packet.project, conversation: conversationTitle, attempt });
 
       const responseData = escalateResult.data as { response: string };
       const rawResponse = responseData.response;

@@ -57,6 +57,16 @@ async function runChaosTest(intensity, duration, seed = null) {
   console.log(`Started: ${new Date().toISOString()}`);
   console.log('');
 
+  // Failure metadata for analysis
+  const failureMetadata = {
+    seed,
+    intensity,
+    duration,
+    failedStep: null,
+    errorReason: null,
+    errorMessage: null
+  };
+
   // Start antagonist
   const python = process.env.PYTHON || 'python';
   console.log('[chaos] Starting antagonist...');
@@ -144,6 +154,20 @@ async function runChaosTest(intensity, duration, seed = null) {
 
     // Validate response
     if (escalateResult.isError) {
+      // Try to extract structured failure metadata from the error content
+      const errorContent = escalateResult.content;
+      if (Array.isArray(errorContent) && errorContent.length > 0) {
+        const errorText = errorContent[0].text || '';
+        try {
+          const errorJson = JSON.parse(errorText);
+          failureMetadata.failedStep = errorJson.failed_step;
+          failureMetadata.errorReason = errorJson.error_reason;
+          failureMetadata.errorMessage = errorJson.error;
+        } catch (e) {
+          // Text error, extract what we can
+          failureMetadata.errorMessage = errorText;
+        }
+      }
       throw new Error(`Escalation returned error: ${JSON.stringify(escalateResult.content)}`);
     }
 
@@ -195,11 +219,31 @@ async function runChaosTest(intensity, duration, seed = null) {
 
   } catch (e) {
     error = e;
+    
+    // If we don't have metadata from structured error, try to parse from exception
+    if (!failureMetadata.errorMessage) {
+      failureMetadata.errorMessage = e.message;
+      
+      // Try to extract failed_step from error message pattern
+      const stepMatch = e.message.match(/step[=: ]?(\d+)/i);
+      if (stepMatch) {
+        failureMetadata.failedStep = parseInt(stepMatch[1]);
+      }
+    }
+    
     console.error('');
     console.error('='.repeat(60));
     console.error('✗ CHAOS TEST FAILED');
     console.error('='.repeat(60));
     console.error('Error:', e.message);
+    console.error('');
+    console.error('FAILURE METADATA (for pattern analysis):');
+    console.error('  Seed:', failureMetadata.seed || 'random');
+    console.error('  Intensity:', failureMetadata.intensity);
+    console.error('  Duration:', failureMetadata.duration + 's');
+    console.error('  Failed Step:', failureMetadata.failedStep || 'unknown');
+    console.error('  Error Reason:', failureMetadata.errorReason || 'unknown');
+    console.error('');
     if (e.stack) {
       console.error('Stack:', e.stack);
     }
@@ -223,7 +267,7 @@ async function runChaosTest(intensity, duration, seed = null) {
     }
   }
 
-  return success;
+  return { success, failureMetadata: success ? null : failureMetadata };
 }
 
 async function runScenarioMatrix(stopOnFail = true, seed = null) {
@@ -248,16 +292,17 @@ async function runScenarioMatrix(stopOnFail = true, seed = null) {
     console.log('');
     console.log(`[matrix] Running scenario ${i + 1}/${SCENARIO_MATRIX.length}: ${scenario.intensity}/${scenario.duration}s (seed: ${scenarioSeed || 'random'})`);
     
-    const success = await runChaosTest(scenario.intensity, scenario.duration, scenarioSeed);
+    const result = await runChaosTest(scenario.intensity, scenario.duration, scenarioSeed);
     
     results.push({
       intensity: scenario.intensity,
       duration: scenario.duration,
       seed: scenarioSeed,
-      success
+      success: result.success,
+      failureMetadata: result.failureMetadata
     });
 
-    if (success) {
+    if (result.success) {
       passed++;
     } else {
       failed++;
@@ -286,8 +331,43 @@ async function runScenarioMatrix(stopOnFail = true, seed = null) {
   console.log('Results:');
   for (const r of results) {
     const status = r.success ? '✓ PASS' : '✗ FAIL';
-    console.log(`  ${status} - ${r.intensity}/${r.duration}s (seed: ${r.seed || 'random'})`);
+    let line = `  ${status} - ${r.intensity}/${r.duration}s (seed: ${r.seed || 'random'})`;
+    if (!r.success && r.failureMetadata) {
+      line += ` | step=${r.failureMetadata.failedStep || '?'} reason=${r.failureMetadata.errorReason || 'unknown'}`;
+    }
+    console.log(line);
   }
+  
+  // Print failure analysis if any failures
+  const failures = results.filter(r => !r.success && r.failureMetadata);
+  if (failures.length > 0) {
+    console.log('');
+    console.log('FAILURE PATTERN ANALYSIS:');
+    
+    // Group by failed step
+    const byStep = {};
+    for (const f of failures) {
+      const step = f.failureMetadata.failedStep || 'unknown';
+      byStep[step] = (byStep[step] || 0) + 1;
+    }
+    console.log('  By Step:', byStep);
+    
+    // Group by error reason
+    const byReason = {};
+    for (const f of failures) {
+      const reason = f.failureMetadata.errorReason || 'unknown';
+      byReason[reason] = (byReason[reason] || 0) + 1;
+    }
+    console.log('  By Reason:', byReason);
+    
+    // Group by intensity
+    const byIntensity = {};
+    for (const f of failures) {
+      byIntensity[f.intensity] = (byIntensity[f.intensity] || 0) + 1;
+    }
+    console.log('  By Intensity:', byIntensity);
+  }
+  
   console.log('='.repeat(60));
 
   return failed === 0;
@@ -300,7 +380,8 @@ async function main() {
   if (args.matrix) {
     success = await runScenarioMatrix(args.stopOnFail, args.seed);
   } else {
-    success = await runChaosTest(args.intensity, args.duration, args.seed);
+    const result = await runChaosTest(args.intensity, args.duration, args.seed);
+    success = result.success;
   }
   
   process.exit(success ? 0 : 1);

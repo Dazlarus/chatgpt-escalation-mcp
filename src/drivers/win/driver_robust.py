@@ -177,64 +177,122 @@ class RobustDriver:
         }
     
     # Convenience method: full escalation in one call
-    def escalate(self, project_name: str, conversation: str, message: str, timeout_ms: int = 600000) -> dict:
+    def escalate(self, project_name: str, conversation: str, message: str, timeout_ms: int = 600000, run_id: str = None) -> dict:
         """
-        Full escalation flow in one call.
+        Full escalation flow in one call using execute_full_flow.
         
-        1. Kill/Start/Focus ChatGPT
-        2. Navigate to project + conversation
-        3. Send message
-        4. Wait for response
-        5. Copy and return response
+        Uses robust_flow's execute_full_flow which has:
+        - Proper phase logging
+        - Navigation retry logic
+        - Response validation
+        - failed_step tracking
+        
+        Includes restart logic for recoverable failures (focus_failed, start_failed).
         """
-        log_debug(f"Starting escalation: project={project_name}, conversation={conversation}")
+        if run_id:
+            log_debug(f"[{run_id}] Starting escalation: project={project_name}, conversation={conversation}")
+        else:
+            log_debug(f"Starting escalation: project={project_name}, conversation={conversation}")
         
-        # Steps 1-3: Initialize
-        if not self.flow.step1_kill_chatgpt():
-            return {"success": False, "error": "Failed to kill existing ChatGPT"}
-        if not self.flow.step2_start_chatgpt():
-            return {"success": False, "error": "Failed to start ChatGPT"}
-        if not self.flow.step3_focus_chatgpt():
-            return {"success": False, "error": "Failed to focus ChatGPT"}
+        # Recoverable error reasons that warrant a full restart
+        RECOVERABLE_REASONS = {"focus_failed", "start_failed", "sidebar_failed", "focus_lost"}
+        max_restarts = 1
         
-        # Step 4: Open sidebar
-        if not self.flow.step4_open_sidebar():
-            return {"success": False, "error": "Failed to open sidebar"}
-        
-        # Step 5: Click project
-        if project_name:
-            if not self.flow.step5_click_project(project_name):
-                return {"success": False, "error": f"Failed to find project: {project_name}"}
-        
-        # Step 6: Click conversation
-        if not self.flow.step6_click_conversation(conversation):
-            return {"success": False, "error": f"Failed to find conversation: {conversation}"}
-        
-        # Step 7+8: Focus & send prompt (merged)
-        log_debug(f"[driver] escalate calling step7_send_prompt, msg_len={len(message)}")
-        if not self.flow.step7_send_prompt(message):
-            log_debug("[driver] step7_send_prompt FAILED in escalate")
-            return {"success": False, "error": "Failed to focus/send message"}
-        log_debug("[driver] step7_send_prompt succeeded in escalate")
-        
-        # Step 9: Wait for response
-        timeout_sec = timeout_ms / 1000.0
-        if not self.flow.step9_wait_for_response(timeout=timeout_sec):
-            return {"success": False, "error": f"Timeout waiting for response"}
-        
-        # Step 10: Copy response
-        response = self.flow.step10_copy_response()
-        if not response:
-            return {"success": False, "error": "Failed to copy response"}
-        
-        return {
-            "success": True,
-            "data": {
-                "response": response,
-                "project": project_name,
-                "conversation": conversation
+        for attempt in range(max_restarts + 1):
+            if attempt > 0:
+                log_debug(f"[{run_id or 'no-run-id'}] RESTART attempt {attempt + 1}: previous failure was recoverable")
+                # Fresh flow instance to reset all state
+                self.flow = RobustChatGPTFlow()
+            
+            # Use the full flow with all its bells and whistles
+            result = self.flow.execute_full_flow(
+                project_name=project_name or "",
+                conversation_name=conversation,
+                prompt=message
+            )
+            
+            if result["success"]:
+                return {
+                    "success": True,
+                    "data": {
+                        "response": result["response"],
+                        "project": project_name,
+                        "conversation": conversation,
+                        "run_id": run_id,
+                        "restart_attempts": attempt
+                    }
+                }
+            
+            # Failure - check if recoverable
+            failed_step = result.get("failed_step")
+            error = result.get("error", "Unknown error")
+            error_reason = self._derive_error_reason(failed_step, error)
+            
+            log_debug(f"[{run_id or 'no-run-id'}] Escalation failed: step={failed_step}, reason={error_reason}, error={error}")
+            
+            # Check if we should retry
+            if attempt < max_restarts and error_reason in RECOVERABLE_REASONS:
+                log_debug(f"[{run_id or 'no-run-id'}] Failure is recoverable ({error_reason}), will restart...")
+                import time
+                time.sleep(2)  # Brief pause before restart
+                continue
+            
+            # Not recoverable or out of retries
+            return {
+                "success": False,
+                "error": error,
+                "failed_step": failed_step,
+                "error_reason": error_reason,
+                "run_id": run_id,
+                "restart_attempts": attempt
             }
+        
+        # Should never reach here, but just in case
+        return {
+            "success": False,
+            "error": "Max restarts exceeded",
+            "failed_step": None,
+            "error_reason": "max_restarts",
+            "run_id": run_id,
+            "restart_attempts": max_restarts
         }
+    
+    def _derive_error_reason(self, step: int, error: str) -> str:
+        """Derive a structured error reason code from step and error message."""
+        if step is None:
+            return "unknown"
+        
+        error_lower = error.lower()
+        
+        # Step-specific reason codes
+        step_reasons = {
+            1: "kill_failed",
+            2: "start_failed",
+            3: "focus_failed",
+            4: "sidebar_failed",
+            5: "project_not_found",
+            6: "conversation_not_found",
+            7: "send_failed",
+            9: "response_timeout",
+            10: "copy_failed",
+        }
+        
+        base_reason = step_reasons.get(step, f"step{step}_failed")
+        
+        # Refine based on error message
+        if "not found" in error_lower or "failed to find" in error_lower:
+            if step == 5:
+                return "project_not_found"
+            elif step == 6:
+                return "conversation_not_found"
+        elif "timeout" in error_lower:
+            return "timeout"
+        elif "focus" in error_lower:
+            return "focus_lost"
+        elif "validation failed" in error_lower:
+            return "invalid_response"
+        
+        return base_reason
 
 
 def main():
@@ -282,7 +340,8 @@ def main():
             project_name=params.get("project_name"),
             conversation=params.get("conversation"),
             message=params.get("message", ""),
-            timeout_ms=params.get("timeout_ms", 600000)
+            timeout_ms=params.get("timeout_ms", 600000),
+            run_id=params.get("run_id")
         )
     
     else:
