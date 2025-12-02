@@ -108,6 +108,34 @@ macOS has different automation APIs (Accessibility API) that would require a com
 
 ## Installation
 
+### Option 1: Install from npm (Recommended)
+
+```powershell
+# Install globally
+npm install -g chatgpt-escalation-mcp
+
+# Install Python dependencies
+pip install pywinauto pyperclip paddleocr paddlepaddle
+
+# Run setup wizard
+chatgpt-escalation-mcp init
+```
+
+### Option 2: Install from GitHub Release
+
+1. Download the latest release from [GitHub Releases](https://github.com/Dazlarus/chatgpt-escalation-mcp/releases)
+2. Extract the ZIP file
+3. Run:
+
+```powershell
+cd chatgpt-escalation-mcp
+npm install
+npm run build
+pip install pywinauto pyperclip paddleocr paddlepaddle
+```
+
+### Option 3: Install from Source
+
 ```powershell
 # Clone the repository
 git clone https://github.com/Dazlarus/chatgpt-escalation-mcp.git
