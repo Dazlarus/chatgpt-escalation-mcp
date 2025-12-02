@@ -185,8 +185,13 @@ def alt_tab_away():
         log(f"alt_tab failed: {e}")
 
 
-def type_garbage_in_chatgpt(chatgpt_hwnd):
-    """Type random text into the ChatGPT input field (if focused)."""
+def type_garbage_in_chatgpt(chatgpt_hwnd, allow_enter: bool = False):
+    """Type random text into the ChatGPT input field (if focused).
+    
+    Args:
+        chatgpt_hwnd: Handle to ChatGPT window
+        allow_enter: If False, NEVER send {ENTER} (prevents new chat creation)
+    """
     if not chatgpt_hwnd:
         return
     try:
@@ -194,16 +199,19 @@ def type_garbage_in_chatgpt(chatgpt_hwnd):
         bring_to_front(chatgpt_hwnd)
         time.sleep(0.1)
         
-        # Type some garbage text
-        garbage = random.choice([
+        # Type some garbage text - ENTER only if explicitly allowed
+        garbage_options = [
             "chaos test ",
             "interference ",
             "random text ",
             "123 ",
             "!!!",
-            "{ENTER}",  # This could send a message!
             "test test test ",
-        ])
+        ]
+        if allow_enter:
+            garbage_options.append("{ENTER}")  # Only in nightmare mode
+        
+        garbage = random.choice(garbage_options)
         send_keys(garbage, pause=0.01)
         log(f"typed garbage: {repr(garbage)}")
     except Exception as e:
@@ -254,6 +262,8 @@ def main():
     screen_h = win32api.GetSystemMetrics(1)
 
     # Probability weights per intensity
+    # NOTE: type_garbage_in_chatgpt never sends ENTER in standard modes (gentle/medium/aggressive)
+    # to prevent new chat creation. Only enable ENTER in nightmare mode for extreme testing.
     if args.intensity == "gentle":
         actions = [
             (random_mouse_move_click, 0.30),
@@ -267,6 +277,7 @@ def main():
             # No garbage typing in gentle mode
         ]
         sleep_range = (0.8, 1.6)
+        allow_enter = False
     elif args.intensity == "aggressive":
         actions = [
             (random_mouse_move_click, 0.20),
@@ -277,9 +288,10 @@ def main():
             (alt_tab_away, 0.10),
             (move_window, 0.10),
             (resize_window, 0.05),
-            (type_garbage_in_chatgpt, 0.15),  # Aggressive includes typing garbage!
+            (type_garbage_in_chatgpt, 0.15),  # Aggressive includes typing garbage (no ENTER)
         ]
         sleep_range = (0.2, 0.8)
+        allow_enter = False  # Was the root cause of chaos test failures!
     else:  # medium
         actions = [
             (random_mouse_move_click, 0.25),
@@ -290,9 +302,10 @@ def main():
             (alt_tab_away, 0.10),
             (move_window, 0.08),
             (resize_window, 0.05),
-            (type_garbage_in_chatgpt, 0.07),  # Medium has some garbage typing
+            (type_garbage_in_chatgpt, 0.07),  # Medium has some garbage typing (no ENTER)
         ]
         sleep_range = (0.5, 1.2)
+        allow_enter = False
 
     # Normalize weights
     total = sum(w for _, w in actions)
@@ -325,7 +338,7 @@ def main():
                 elif chosen in (type_garbage_in_chatgpt,):
                     if chatgpt_hwnd is None:
                         chatgpt_hwnd = find_hwnd_for_process_name(target_proc)
-                    chosen(chatgpt_hwnd)
+                    chosen(chatgpt_hwnd, allow_enter=allow_enter)
                 elif chosen in (occlude_with_notepad,):
                     chosen(opened_windows)
                 elif chosen in (random_mouse_move_click,):

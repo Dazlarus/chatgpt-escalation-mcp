@@ -1,6 +1,6 @@
 {
   "name": "chatgpt-escalation-mcp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "MCP server that allows autonomous coding agents to escalate questions to ChatGPT Desktop automatically",
   "main": "dist/src/server.js",
   "bin": {

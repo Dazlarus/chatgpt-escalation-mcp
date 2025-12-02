@@ -56,11 +56,13 @@ An MCP (Model Context Protocol) server that enables autonomous coding agents to 
 3. **Focus Window** - Bring to foreground
 4. **Open Sidebar** - Click hamburger menu (pixel detection for state)
 5. **Click Project** - OCR + fuzzy matching to find folder
-6. **Click Conversation** - OCR + fuzzy matching to find chat
+6. **Click Conversation** - OCR + fuzzy matching to find chat (Ctrl+K fallback if not found)
 7. **Focus Input** - Click text input area
 8. **Send Prompt** - Paste and submit
 9. **Wait for Response** - Pixel-based stop button detection
 10. **Copy Response** - Robust button probing to find copy button
+
+**Automatic Retry Logic**: If any step fails, the entire flow restarts (up to 4 attempts total). Each retry gets a fresh ChatGPT instance. Most failures are transient (focus lost, window minimized) and succeed on retry.
 
 ## System Requirements
 
@@ -92,7 +94,15 @@ macOS has different automation APIs (Accessibility API) that would require a com
 |-----------|---------|--------|
 | **ChatGPT Desktop** | 1.2025.112 | ✅ Tested |
 | **Windows 11** | 24H2 (Build 26100.2605) | ✅ Tested |
-| **Last Verified** | November 30, 2025 | |
+| **Last Verified** | December 2, 2025 | |
+
+### Robustness Features
+
+- **Automatic Retries**: Up to 4 attempts per escalation with intelligent failure detection
+- **Structured Observability**: Every escalation gets a unique `run_id` for correlation and debugging
+- **Error Reason Codes**: 12+ specific error codes (e.g., `focus_failed`, `project_not_found`, `empty_response`)
+- **Chaos Tested**: Passes aggressive chaos testing (random focus stealing, window minimization, mouse interference)
+- **Smart Fallbacks**: Ctrl+K search if conversation not visible in sidebar
 
 > 💡 **After ChatGPT Updates:** UI automation may break if ChatGPT significantly changes their layout. If you encounter issues after an update, please [open an issue](../../issues) with your ChatGPT version.
 
@@ -720,4 +730,14 @@ Runs a full end-to-end test:
 6. Reports pass/fail
 
 This verifies that safety guardrails successfully recover from interruptions during a real escalation flow.
+
+**Current Test Results:**
+- ✅ **Gentle**: Passes consistently
+- ✅ **Medium**: Passes consistently
+- ✅ **Aggressive**: Passes with retry logic (may take 2-4 attempts)
+
+**Seeded Tests**: Use `--seed=12345` for reproducible chaos patterns:
+```pwsh
+node tools/chaos_escalation_test.js aggressive --duration=120 --seed=99999
+```
 

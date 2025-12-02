@@ -990,6 +990,10 @@ class RobustChatGPTFlow:
         
         After clicking a project, sidebar closes and conversations appear in center.
         
+        Strategy (in order):
+        1. Scan project view with scroll (primary method)
+        2. Fallback: Ctrl+K search (if scan fails)
+        
         Verification: Window title contains conversation name.
         """
         import win32gui
@@ -1036,9 +1040,68 @@ class RobustChatGPTFlow:
                     # Still return true - might be OK
                     return True
         
-        log_phase(6, f"click_conversation:{conversation_name}", "FAIL:not_found")
-        log_debug(f"  ✗ FAILED: Could not find/click '{conversation_name}' after {max_attempts} attempts")
+        # Primary scan failed - try Ctrl+K search as fallback
+        log_phase(6, f"click_conversation:{conversation_name}", "FALLBACK:ctrl_k_search")
+        log_debug(f"  Primary scan failed, trying Ctrl+K search fallback...")
+        
+        if self._search_and_open_conversation(conversation_name):
+            # Verify by checking window title
+            time.sleep(0.8)
+            title = win32gui.GetWindowText(self.hwnd)
+            if self._fuzzy_match(conversation_name, title):
+                log_phase(6, f"click_conversation:{conversation_name}", "OK:ctrl_k_match")
+                log_debug(f"  ✓ VERIFIED via Ctrl+K: Window title is '{title}'")
+                return True
+            else:
+                log_phase(6, f"click_conversation:{conversation_name}", "OK:ctrl_k_no_verify")
+                log_debug(f"  ⚠ Ctrl+K done but title='{title}' doesn't match")
+                return True
+        
+        log_phase(6, f"click_conversation:{conversation_name}", "FAIL:not_found_after_fallback")
+        log_debug(f"  ✗ FAILED: Could not find/click '{conversation_name}' after {max_attempts} attempts + Ctrl+K fallback")
         return False
+    
+    def _search_and_open_conversation(self, conversation_name: str) -> bool:
+        """
+        Use Ctrl+K search to find and open a conversation directly.
+        This is a fallback when project view scanning fails.
+        """
+        from pywinauto.keyboard import send_keys
+        import win32gui
+        
+        log_debug(f"  [ctrl+k] Searching for '{conversation_name}'...")
+        
+        try:
+            # Ensure foreground
+            if not self._ensure_foreground():
+                log_debug("  [ctrl+k] Could not ensure foreground")
+                return False
+            
+            # Press Ctrl+K to open search
+            send_keys("^k", pause=0.05)
+            time.sleep(0.5)
+            
+            # Type the conversation name
+            # Use a shorter search term for better matching
+            search_term = conversation_name[:30] if len(conversation_name) > 30 else conversation_name
+            send_keys(search_term, pause=0.02, with_spaces=True)
+            time.sleep(0.8)
+            
+            # Press Enter to select first result
+            send_keys("{ENTER}", pause=0.05)
+            time.sleep(0.5)
+            
+            # Check if we landed somewhere
+            if self._ensure_foreground():
+                title = win32gui.GetWindowText(self.hwnd)
+                log_debug(f"  [ctrl+k] After search, title is '{title}'")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            log_debug(f"  [ctrl+k] Error: {e}")
+            return False
     
     def _fuzzy_match(self, target: str, text: str, threshold: float = 0.6) -> bool:
         """Simple fuzzy match - check if words overlap."""

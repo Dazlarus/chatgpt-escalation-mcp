@@ -187,22 +187,37 @@ class RobustDriver:
         - Response validation
         - failed_step tracking
         
-        Includes restart logic for recoverable failures (focus_failed, start_failed).
+        Includes aggressive retry logic - will retry the ENTIRE flow multiple times
+        since many failures are transient (chaos moved window, focus lost, etc).
+        
+        If all retries fail, returns a clear error message instructing the user
+        not to interfere while the agent is working.
         """
         if run_id:
             log_debug(f"[{run_id}] Starting escalation: project={project_name}, conversation={conversation}")
         else:
             log_debug(f"Starting escalation: project={project_name}, conversation={conversation}")
         
-        # Recoverable error reasons that warrant a full restart
-        RECOVERABLE_REASONS = {"focus_failed", "start_failed", "sidebar_failed", "focus_lost"}
-        max_restarts = 1
+        # Almost all failures are recoverable - the whole point is to retry the entire flow
+        # Only truly fatal errors (like invalid config) should not be retried
+        NON_RECOVERABLE_REASONS = {
+            "invalid_config",    # Bad project/conversation names
+            "invalid_response",  # Response validation failed (not a retry issue)
+        }
         
-        for attempt in range(max_restarts + 1):
+        max_attempts = 4  # Try up to 4 times total (initial + 3 retries)
+        last_error = None
+        last_step = None
+        last_reason = None
+        
+        for attempt in range(max_attempts):
             if attempt > 0:
-                log_debug(f"[{run_id or 'no-run-id'}] RESTART attempt {attempt + 1}: previous failure was recoverable")
+                log_debug(f"[{run_id or 'no-run-id'}] RETRY attempt {attempt + 1}/{max_attempts}: restarting entire flow")
                 # Fresh flow instance to reset all state
                 self.flow = RobustChatGPTFlow()
+                # Brief pause between retries - not too long or chaos will time out
+                import time
+                time.sleep(1.5)
             
             # Use the full flow with all its bells and whistles
             result = self.flow.execute_full_flow(
@@ -212,49 +227,61 @@ class RobustDriver:
             )
             
             if result["success"]:
-                return {
-                    "success": True,
-                    "data": {
-                        "response": result["response"],
-                        "project": project_name,
-                        "conversation": conversation,
-                        "run_id": run_id,
-                        "restart_attempts": attempt
+                response = result.get("response", "")
+                # Check if we actually got a response
+                if response and len(response.strip()) > 10:
+                    return {
+                        "success": True,
+                        "data": {
+                            "response": response,
+                            "project": project_name,
+                            "conversation": conversation,
+                            "run_id": run_id,
+                            "attempts": attempt + 1
+                        }
                     }
-                }
+                else:
+                    # "Success" but empty/invalid response - treat as failure and retry
+                    log_debug(f"[{run_id or 'no-run-id'}] Flow succeeded but response is empty/invalid, retrying...")
+                    last_error = "Response was empty or too short"
+                    last_step = 10
+                    last_reason = "empty_response"
+                    continue
             
-            # Failure - check if recoverable
+            # Failure - capture details
             failed_step = result.get("failed_step")
             error = result.get("error", "Unknown error")
             error_reason = self._derive_error_reason(failed_step, error)
             
-            log_debug(f"[{run_id or 'no-run-id'}] Escalation failed: step={failed_step}, reason={error_reason}, error={error}")
+            last_error = error
+            last_step = failed_step
+            last_reason = error_reason
             
-            # Check if we should retry
-            if attempt < max_restarts and error_reason in RECOVERABLE_REASONS:
-                log_debug(f"[{run_id or 'no-run-id'}] Failure is recoverable ({error_reason}), will restart...")
-                import time
-                time.sleep(2)  # Brief pause before restart
-                continue
+            log_debug(f"[{run_id or 'no-run-id'}] Attempt {attempt + 1} failed: step={failed_step}, reason={error_reason}, error={error}")
             
-            # Not recoverable or out of retries
-            return {
-                "success": False,
-                "error": error,
-                "failed_step": failed_step,
-                "error_reason": error_reason,
-                "run_id": run_id,
-                "restart_attempts": attempt
-            }
+            # Check if this is a non-recoverable error
+            if error_reason in NON_RECOVERABLE_REASONS:
+                log_debug(f"[{run_id or 'no-run-id'}] Non-recoverable error ({error_reason}), stopping retries")
+                break
+            
+            # Otherwise, we'll retry on the next iteration
         
-        # Should never reach here, but just in case
+        # All attempts failed - return a clear error message for the agent to relay to the user
+        user_message = (
+            f"ChatGPT escalation failed after {max_attempts} attempts. "
+            f"Last failure was at step {last_step} ({last_reason}): {last_error}. "
+            f"\n\n⚠️ IMPORTANT: Please keep your hands off the keyboard and mouse while the agent is working with ChatGPT. "
+            f"Window movements, clicks, or keyboard input can interfere with the automation. "
+            f"If the problem persists, try closing other applications and running the escalation again."
+        )
+        
         return {
             "success": False,
-            "error": "Max restarts exceeded",
-            "failed_step": None,
-            "error_reason": "max_restarts",
+            "error": user_message,
+            "failed_step": last_step,
+            "error_reason": last_reason,
             "run_id": run_id,
-            "restart_attempts": max_restarts
+            "attempts": max_attempts
         }
     
     def _derive_error_reason(self, step: int, error: str) -> str:
@@ -280,7 +307,9 @@ class RobustDriver:
         base_reason = step_reasons.get(step, f"step{step}_failed")
         
         # Refine based on error message
-        if "not found" in error_lower or "failed to find" in error_lower:
+        if "empty" in error_lower or "too short" in error_lower:
+            return "empty_response"
+        elif "not found" in error_lower or "failed to find" in error_lower:
             if step == 5:
                 return "project_not_found"
             elif step == 6:

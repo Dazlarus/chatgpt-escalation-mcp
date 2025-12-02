@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2025-12-02
+
+### Added
+- **Structured Observability**
+  - Unique `run_id` generated for each escalation (format: `run-{timestamp}-{random}`)
+  - Error reason codes for every failure type (e.g., `focus_failed`, `conversation_not_found`, `copy_failed`)
+  - Step-level failure tracking - know exactly which step failed and why
+  - Failure metadata captured in logs and returned to MCP client
+
+- **Automatic Retry Logic**
+  - Up to 4 attempts for any escalation (initial + 3 retries)
+  - Intelligent retry detection - most failures are treated as recoverable
+  - Fresh state on each retry (kills and restarts ChatGPT)
+  - 1.5s pause between retries for stability
+  - Empty response detection - retries if response is too short or missing
+
+- **Enhanced Chaos Resilience**
+  - Ctrl+K search fallback in step 6 if conversation not found via scroll
+  - Antagonist improvements - no longer sends Enter in standard chaos modes (prevents new chat creation)
+  - Passes gentle and medium chaos consistently
+  - Passes aggressive chaos with retry logic (may need multiple attempts)
+
+- **Better Error Messages**
+  - User-facing error messages when all retries exhausted
+  - Clear instruction to "keep hands off keyboard/mouse during automation"
+  - Detailed failure context for debugging
+
+### Changed
+- Retry delay reduced from 3s to 1.5s for faster recovery
+- Error handling now distinguishes between recoverable and fatal errors
+- `_derive_error_reason()` enhanced to detect empty responses
+
+### Fixed
+- Chaos tests now validate that failures are true automation issues, not user interference
+- Step 6 (conversation navigation) more robust with Ctrl+K fallback
+- Step 10 (copy response) now retries on failure instead of giving up
+
 ## [1.0.0] - 2024-11-30
 
 ### Added
