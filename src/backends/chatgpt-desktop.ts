@@ -74,9 +74,25 @@ async function executeWindowsDriver(command: DriverCommand): Promise<DriverResul
   const driverPath = getDriverPath("win");
   logger.debug("Executing Windows driver", { command: command.action, driverPath });
 
+  // Security: Validate driver path exists and is within expected directory
+  const validatedPath = path.resolve(driverPath);
+  if (!fs.existsSync(validatedPath)) {
+    logger.error("Driver script not found", { path: validatedPath });
+    return { success: false, error: `Driver not found: ${path.basename(validatedPath)}` };
+  }
+
+  // Security: Ensure path is within src/drivers directory
+  const driversDir = path.resolve(process.cwd(), "src", "drivers");
+  if (!validatedPath.startsWith(driversDir)) {
+    logger.error("Driver path outside allowed directory", { path: validatedPath });
+    return { success: false, error: "Invalid driver path" };
+  }
+
   return new Promise((resolve) => {
-    const python = spawn("python", [driverPath], {
+    const python = spawn("python", [validatedPath], {
       stdio: ["pipe", "pipe", "pipe"],
+      detached: false,
+      shell: false, // Security: Never use shell to prevent command injection
     });
 
     let stdout = "";

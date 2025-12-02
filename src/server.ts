@@ -22,26 +22,36 @@ const ESCALATE_TOOL_SCHEMA = {
     project: {
       type: "string",
       description: "Project ID defined in user config",
+      minLength: 1,
+      maxLength: 100,
+      pattern: "^[a-zA-Z0-9_-]+$",
     },
     reason: {
       type: "string",
       description: "Why are you escalating this question?",
+      minLength: 10,
+      maxLength: 500,
     },
     question: {
       type: "string",
       description: "The specific question you need answered",
+      minLength: 10,
+      maxLength: 5000,
     },
     attempted: {
       type: "string",
       description: "What have you already tried?",
+      maxLength: 2000,
     },
     projectContext: {
       type: "string",
       description: "Relevant context about the project",
+      maxLength: 2000,
     },
     artifacts: {
       type: "array",
       description: "Supporting code snippets, logs, or notes",
+      maxItems: 10,
       items: {
         type: "object",
         properties: {
@@ -53,10 +63,12 @@ const ESCALATE_TOOL_SCHEMA = {
           pathOrLabel: {
             type: "string",
             description: "File path or label for the artifact",
+            maxLength: 500,
           },
           content: {
             type: "string",
             description: "Content of the artifact",
+            maxLength: 10000,
           },
         },
         required: ["type", "content"],

@@ -11,7 +11,7 @@ Achieves 100% accuracy on test images.
 """
 import numpy as np
 from PIL import Image, ImageGrab
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict, Any
 import io
 
 
@@ -19,15 +19,15 @@ class SidebarHoverDetector:
     """Detects which menu item is highlighted in ChatGPT sidebar using pixel analysis."""
     
     # ChatGPT light theme colors
-    NORMAL_BG = 249  # Normal background brightness
-    HOVER_BG_MIN = 235  # Hover background is darker
-    HOVER_BG_MAX = 247
+    NORMAL_BG: int = 249  # Normal background brightness
+    HOVER_BG_MIN: int = 235  # Hover background is darker
+    HOVER_BG_MAX: int = 247
     
     def __init__(self, 
                  row_height: int = 35,
                  top_skip: int = 35,
                  bottom_skip: int = 40,
-                 deviation_threshold: float = 2.0):
+                 deviation_threshold: float = 2.0) -> None:
         """
         Initialize detector.
         
@@ -37,25 +37,27 @@ class SidebarHoverDetector:
             bottom_skip: Pixels to skip from bottom
             deviation_threshold: Minimum deviation from normal bg to detect hover
         """
-        self.row_height = row_height
-        self.top_skip = top_skip
-        self.bottom_skip = bottom_skip
-        self.deviation_threshold = deviation_threshold
+        self.row_height: int = row_height
+        self.top_skip: int = top_skip
+        self.bottom_skip: int = bottom_skip
+        self.deviation_threshold: float = deviation_threshold
     
     def capture_sidebar(self, hwnd: int) -> Image.Image:
         """Capture sidebar region of ChatGPT window."""
         import win32gui
         
-        rect = win32gui.GetWindowRect(hwnd)
-        window_width = rect[2] - rect[0]
-        sidebar_width = int(window_width * 0.28)
+        rect: Tuple[int, int, int, int] = win32gui.GetWindowRect(hwnd)
+        window_width: int = rect[2] - rect[0]
+        sidebar_width: int = int(window_width * 0.28)
         
-        capture_rect = (rect[0], rect[1], rect[0] + sidebar_width, rect[3])
+        capture_rect: Tuple[int, int, int, int] = (rect[0], rect[1], rect[0] + sidebar_width, rect[3])
         return ImageGrab.grab(bbox=capture_rect)
     
-    def analyze_rows(self, sidebar_img: Image.Image) -> List[dict]:
+    def analyze_rows(self, sidebar_img: Image.Image) -> List[Dict[str, Any]]:
         """Analyze brightness of each row in the sidebar."""
-        arr = np.array(sidebar_img)
+        arr: np.ndarray = np.array(sidebar_img)
+        height: int
+        width: int
         height, width = arr.shape[:2]
         
         # Convert to grayscale using luminance formula

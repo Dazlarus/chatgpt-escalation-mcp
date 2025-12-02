@@ -112,9 +112,9 @@ export function saveConfig(config: AppConfig): void {
   const configDir = getConfigDir();
   const configPath = getConfigPath();
 
-  // Ensure config directory exists
+  // Ensure config directory exists with proper permissions
   if (!fs.existsSync(configDir)) {
-    fs.mkdirSync(configDir, { recursive: true });
+    fs.mkdirSync(configDir, { recursive: true, mode: 0o700 }); // Owner read/write/execute only
   }
 
   try {
