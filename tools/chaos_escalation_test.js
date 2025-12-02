@@ -9,39 +9,67 @@
  * 4. Reports pass/fail
  * 
  * Usage:
- *   node tools/chaos_escalation_test.js [--intensity=aggressive] [--duration=90]
+ *   node tools/chaos_escalation_test.js [--intensity=aggressive] [--duration=90] [--seed=12345]
+ *   node tools/chaos_escalation_test.js --matrix  # Run full scenario matrix
  */
 
 const { spawn } = require('child_process');
 const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
 const { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
 
+// Scenario matrix for comprehensive testing
+const SCENARIO_MATRIX = [
+  { intensity: 'gentle', duration: 30 },
+  { intensity: 'gentle', duration: 60 },
+  { intensity: 'medium', duration: 30 },
+  { intensity: 'medium', duration: 60 },
+  { intensity: 'aggressive', duration: 30 },
+  { intensity: 'aggressive', duration: 60 },
+];
+
 function parseArgs(argv) {
-  const parsed = { intensity: 'aggressive', duration: '90' };
+  const parsed = { 
+    intensity: 'aggressive', 
+    duration: '90', 
+    seed: null,
+    matrix: false,
+    stopOnFail: true  // Stop matrix on first failure
+  };
   for (const a of argv.slice(2)) {
     if (a.startsWith('--intensity=')) parsed.intensity = a.split('=')[1];
     else if (a.startsWith('--duration=')) parsed.duration = a.split('=')[1];
+    else if (a.startsWith('--seed=')) parsed.seed = a.split('=')[1];
+    else if (a === '--matrix') parsed.matrix = true;
+    else if (a === '--no-stop-on-fail') parsed.stopOnFail = false;
+    // Also accept positional args: gentle, medium, aggressive
+    else if (['gentle', 'medium', 'aggressive'].includes(a)) parsed.intensity = a;
   }
   return parsed;
 }
 
-async function runChaosTest(intensity, duration) {
+async function runChaosTest(intensity, duration, seed = null) {
   console.log('='.repeat(60));
   console.log('CHAOS ESCALATION TEST');
   console.log('='.repeat(60));
   console.log(`Intensity: ${intensity}`);
   console.log(`Duration: ${duration}s`);
+  console.log(`Seed: ${seed || 'random'}`);
+  console.log(`Started: ${new Date().toISOString()}`);
   console.log('');
 
   // Start antagonist
   const python = process.env.PYTHON || 'python';
   console.log('[chaos] Starting antagonist...');
-  const ant = spawn(python, [
+  const antArgs = [
     'src/testing/antagonist.py',
-    '--duration', duration,
+    '--duration', String(duration),
     '--intensity', intensity,
     '--target', 'ChatGPT'
-  ], { stdio: ['ignore', 'inherit', 'inherit'], shell: true });
+  ];
+  if (seed !== null) {
+    antArgs.push('--seed', String(seed));
+  }
+  const ant = spawn(python, antArgs, { stdio: ['ignore', 'inherit', 'inherit'], shell: true });
 
   // Wait a bit for antagonist to start
   await new Promise(resolve => setTimeout(resolve, 1000));
@@ -98,6 +126,9 @@ async function runChaosTest(intensity, duration) {
     console.log('[chaos] Escalating test question...');
     const testQuestion = 'What are 3 examples of renewable energy sources? Answer in one sentence.';
     
+    // Use extended timeout for chaos testing - operations take much longer under chaos
+    const chaosTimeout = 300000;  // 5 minutes
+    
     const escalateResult = await client.callTool({
       name: 'escalate_to_expert',
       arguments: {
@@ -107,7 +138,7 @@ async function runChaosTest(intensity, duration) {
         attempted: 'None - this is a direct test',
         artifacts: []
       }
-    });
+    }, undefined, { timeout: chaosTimeout });
 
     console.log('[chaos] Escalation completed');
 
@@ -195,9 +226,83 @@ async function runChaosTest(intensity, duration) {
   return success;
 }
 
+async function runScenarioMatrix(stopOnFail = true, seed = null) {
+  console.log('='.repeat(60));
+  console.log('CHAOS ESCALATION MATRIX TEST');
+  console.log('='.repeat(60));
+  console.log(`Running ${SCENARIO_MATRIX.length} scenarios`);
+  console.log(`Stop on fail: ${stopOnFail}`);
+  console.log(`Base seed: ${seed || 'random'}`);
+  console.log('='.repeat(60));
+  console.log('');
+
+  const results = [];
+  let passed = 0;
+  let failed = 0;
+
+  for (let i = 0; i < SCENARIO_MATRIX.length; i++) {
+    const scenario = SCENARIO_MATRIX[i];
+    // Use deterministic seed per scenario if base seed provided
+    const scenarioSeed = seed !== null ? (parseInt(seed) + i * 1000) : null;
+    
+    console.log('');
+    console.log(`[matrix] Running scenario ${i + 1}/${SCENARIO_MATRIX.length}: ${scenario.intensity}/${scenario.duration}s (seed: ${scenarioSeed || 'random'})`);
+    
+    const success = await runChaosTest(scenario.intensity, scenario.duration, scenarioSeed);
+    
+    results.push({
+      intensity: scenario.intensity,
+      duration: scenario.duration,
+      seed: scenarioSeed,
+      success
+    });
+
+    if (success) {
+      passed++;
+    } else {
+      failed++;
+      if (stopOnFail) {
+        console.log(`[matrix] Stopping on first failure`);
+        break;
+      }
+    }
+
+    // Brief pause between scenarios
+    if (i < SCENARIO_MATRIX.length - 1) {
+      console.log('[matrix] Pausing 5s before next scenario...');
+      await new Promise(resolve => setTimeout(resolve, 5000));
+    }
+  }
+
+  // Print summary
+  console.log('');
+  console.log('='.repeat(60));
+  console.log('MATRIX TEST SUMMARY');
+  console.log('='.repeat(60));
+  console.log(`Total: ${results.length} scenarios`);
+  console.log(`Passed: ${passed}`);
+  console.log(`Failed: ${failed}`);
+  console.log('');
+  console.log('Results:');
+  for (const r of results) {
+    const status = r.success ? '✓ PASS' : '✗ FAIL';
+    console.log(`  ${status} - ${r.intensity}/${r.duration}s (seed: ${r.seed || 'random'})`);
+  }
+  console.log('='.repeat(60));
+
+  return failed === 0;
+}
+
 async function main() {
   const args = parseArgs(process.argv);
-  const success = await runChaosTest(args.intensity, args.duration);
+  
+  let success;
+  if (args.matrix) {
+    success = await runScenarioMatrix(args.stopOnFail, args.seed);
+  } else {
+    success = await runChaosTest(args.intensity, args.duration, args.seed);
+  }
+  
   process.exit(success ? 0 : 1);
 }
 

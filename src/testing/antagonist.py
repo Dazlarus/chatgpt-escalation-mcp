@@ -153,6 +153,85 @@ def random_scroll():
     log(f"scroll {wheel}")
 
 
+def move_window(hwnd):
+    """Move the target window to a random position on screen."""
+    if not hwnd or not win32gui.IsWindow(hwnd):
+        return
+    try:
+        screen_w = win32api.GetSystemMetrics(0)
+        screen_h = win32api.GetSystemMetrics(1)
+        
+        # Get current window rect
+        rect = win32gui.GetWindowRect(hwnd)
+        width = rect[2] - rect[0]
+        height = rect[3] - rect[1]
+        
+        # Random new position (keep most of window on screen)
+        new_x = random.randint(-width // 2, screen_w - width // 2)
+        new_y = random.randint(0, screen_h - height // 2)
+        
+        win32gui.MoveWindow(hwnd, new_x, new_y, width, height, True)
+        log(f"moved window to ({new_x},{new_y})")
+    except Exception as e:
+        log(f"move_window failed: {e}")
+
+
+def alt_tab_away():
+    """Press Alt+Tab to switch away from current window."""
+    try:
+        send_keys("%{TAB}")  # Alt+Tab
+        log("sent Alt+Tab")
+    except Exception as e:
+        log(f"alt_tab failed: {e}")
+
+
+def type_garbage_in_chatgpt(chatgpt_hwnd):
+    """Type random text into the ChatGPT input field (if focused)."""
+    if not chatgpt_hwnd:
+        return
+    try:
+        # First bring ChatGPT to front
+        bring_to_front(chatgpt_hwnd)
+        time.sleep(0.1)
+        
+        # Type some garbage text
+        garbage = random.choice([
+            "chaos test ",
+            "interference ",
+            "random text ",
+            "123 ",
+            "!!!",
+            "{ENTER}",  # This could send a message!
+            "test test test ",
+        ])
+        send_keys(garbage, pause=0.01)
+        log(f"typed garbage: {repr(garbage)}")
+    except Exception as e:
+        log(f"type_garbage failed: {e}")
+
+
+def resize_window(hwnd):
+    """Resize the target window to a random size."""
+    if not hwnd or not win32gui.IsWindow(hwnd):
+        return
+    try:
+        screen_w = win32api.GetSystemMetrics(0)
+        screen_h = win32api.GetSystemMetrics(1)
+        
+        # Get current window rect
+        rect = win32gui.GetWindowRect(hwnd)
+        x, y = rect[0], rect[1]
+        
+        # Random new size (reasonable bounds)
+        new_width = random.randint(400, screen_w)
+        new_height = random.randint(300, screen_h)
+        
+        win32gui.MoveWindow(hwnd, x, y, new_width, new_height, True)
+        log(f"resized window to {new_width}x{new_height}")
+    except Exception as e:
+        log(f"resize_window failed: {e}")
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--duration", type=int, default=60, help="Duration in seconds")
@@ -177,29 +256,41 @@ def main():
     # Probability weights per intensity
     if args.intensity == "gentle":
         actions = [
-            (random_mouse_move_click, 0.35),
-            (focus_away_from_chatgpt, 0.20),
-            (occlude_with_notepad, 0.15),
+            (random_mouse_move_click, 0.30),
+            (focus_away_from_chatgpt, 0.15),
+            (occlude_with_notepad, 0.10),
             (random_scroll, 0.15),
-            (minimize_chatgpt, 0.15),
+            (minimize_chatgpt, 0.10),
+            (alt_tab_away, 0.10),
+            (move_window, 0.05),
+            (resize_window, 0.05),
+            # No garbage typing in gentle mode
         ]
         sleep_range = (0.8, 1.6)
     elif args.intensity == "aggressive":
         actions = [
-            (random_mouse_move_click, 0.35),
-            (focus_away_from_chatgpt, 0.20),
-            (occlude_with_notepad, 0.20),
-            (random_scroll, 0.10),
-            (minimize_chatgpt, 0.15),
+            (random_mouse_move_click, 0.20),
+            (focus_away_from_chatgpt, 0.15),
+            (occlude_with_notepad, 0.10),
+            (random_scroll, 0.05),
+            (minimize_chatgpt, 0.10),
+            (alt_tab_away, 0.10),
+            (move_window, 0.10),
+            (resize_window, 0.05),
+            (type_garbage_in_chatgpt, 0.15),  # Aggressive includes typing garbage!
         ]
         sleep_range = (0.2, 0.8)
-    else:
+    else:  # medium
         actions = [
-            (random_mouse_move_click, 0.35),
-            (focus_away_from_chatgpt, 0.20),
-            (occlude_with_notepad, 0.20),
-            (random_scroll, 0.15),
+            (random_mouse_move_click, 0.25),
+            (focus_away_from_chatgpt, 0.15),
+            (occlude_with_notepad, 0.10),
+            (random_scroll, 0.10),
             (minimize_chatgpt, 0.10),
+            (alt_tab_away, 0.10),
+            (move_window, 0.08),
+            (resize_window, 0.05),
+            (type_garbage_in_chatgpt, 0.07),  # Medium has some garbage typing
         ]
         sleep_range = (0.5, 1.2)
 
@@ -226,11 +317,15 @@ def main():
 
             # Execute chosen action
             try:
-                if chosen in (minimize_chatgpt,):
+                if chosen in (minimize_chatgpt, move_window, resize_window):
                     if chatgpt_hwnd is None:
                         chatgpt_hwnd = find_hwnd_for_process_name(target_proc)
                     if chatgpt_hwnd:
                         chosen(chatgpt_hwnd)
+                elif chosen in (type_garbage_in_chatgpt,):
+                    if chatgpt_hwnd is None:
+                        chatgpt_hwnd = find_hwnd_for_process_name(target_proc)
+                    chosen(chatgpt_hwnd)
                 elif chosen in (occlude_with_notepad,):
                     chosen(opened_windows)
                 elif chosen in (random_mouse_move_click,):

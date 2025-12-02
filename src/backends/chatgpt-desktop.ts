@@ -176,6 +176,61 @@ async function executeDriver(
 }
 
 /**
+ * Detect if a response is a template echo instead of a real answer.
+ * ChatGPT sometimes returns the format template instead of answering.
+ */
+function isTemplateResponse(parsed: unknown): boolean {
+  if (typeof parsed !== "object" || parsed === null) {
+    return false;
+  }
+  
+  const response = parsed as Record<string, unknown>;
+  
+  // Check for template priority (contains | indicating it's the template text)
+  const priority = String(response.priority || "");
+  if (priority.includes("|")) {
+    logger.debug("Template detected: priority contains '|'");
+    return true;
+  }
+  
+  // Check for template guidance phrases
+  const guidance = String(response.guidance || "").toLowerCase();
+  const templatePhrases = [
+    "one-sentence summary",
+    "your main guidance",
+    "explanation here",
+    "what the agent should do",
+  ];
+  for (const phrase of templatePhrases) {
+    if (guidance.includes(phrase)) {
+      logger.debug(`Template detected: guidance contains '${phrase}'`);
+      return true;
+    }
+  }
+  
+  // Check for template action_plan with generic steps
+  const actionPlan = response.action_plan;
+  if (Array.isArray(actionPlan)) {
+    const templateSteps = ["step 1", "step 2", "step 3", "action 1", "action 2"];
+    for (const step of actionPlan) {
+      const stepLower = String(step).toLowerCase().trim();
+      if (templateSteps.includes(stepLower)) {
+        logger.debug(`Template detected: action_plan contains '${step}'`);
+        return true;
+      }
+    }
+  }
+  
+  // Check for wrong field name (notes_for_darien instead of notes_for_user)
+  if ("notes_for_darien" in response) {
+    logger.debug("Template detected: contains 'notes_for_darien' instead of 'notes_for_user'");
+    return true;
+  }
+  
+  return false;
+}
+
+/**
  * Send an escalation to ChatGPT Desktop
  */
 async function sendEscalation(
@@ -184,6 +239,8 @@ async function sendEscalation(
 ): Promise<ExpertResponse> {
   return withMutex(async () => {
     const { platform, responseTimeout } = config.chatgpt;
+    const maxTemplateRetries = 2;  // Retry up to 2 times if template detected
+    
     logger.info("Sending escalation via ChatGPT Desktop", {
       project: packet.project,
       platform,
@@ -205,53 +262,75 @@ async function sendEscalation(
     const prompt = buildPrompt(packet);
     logger.debug("Built prompt", { length: prompt.length });
 
-    // Run escalate flow in the driver in a single call. This avoids creating multiple ephemeral driver
-    // processes which start/stop ChatGPT repeatedly and cause the UI to be unstable.
     const conversationTitle = getProjectConversation(config, packet.project);
     if (!conversationTitle) {
       throw new Error(`No conversation configured for project: ${packet.project}`);
     }
     const projectFolder = getProjectFolder(config, packet.project);
 
-    const escalateResult = await executeDriver(platform, {
-      action: "escalate",
-      params: {
-        project_name: projectFolder || undefined,
-        conversation: conversationTitle,
-        message: prompt,
-        timeout_ms: responseTimeout,
-      },
-    });
-    if (!escalateResult.success) {
-      throw new Error(`Escalation failed: ${escalateResult.error}`);
+    // Retry loop for template detection
+    for (let attempt = 1; attempt <= maxTemplateRetries + 1; attempt++) {
+      const isRetry = attempt > 1;
+      const messageToSend = isRetry 
+        ? `You returned the JSON template format instead of actually answering. Please read my QUESTION and respond with a real answer using the JSON format:\n\n${prompt}`
+        : prompt;
+      
+      if (isRetry) {
+        logger.info(`Retrying after template response (attempt ${attempt})`);
+      }
+
+      const escalateResult = await executeDriver(platform, {
+        action: "escalate",
+        params: {
+          project_name: projectFolder || undefined,
+          conversation: conversationTitle,
+          message: messageToSend,
+          timeout_ms: responseTimeout,
+        },
+      });
+      if (!escalateResult.success) {
+        throw new Error(`Escalation failed: ${escalateResult.error}`);
+      }
+      logger.debug("Escalation completed", { project: packet.project, conversation: conversationTitle, attempt });
+
+      const responseData = escalateResult.data as { response: string };
+      const rawResponse = responseData.response;
+      logger.debug("Got raw response", { length: rawResponse.length });
+
+      // Parse JSON response
+      const jsonText = extractJson(rawResponse);
+      let parsed: unknown;
+
+      try {
+        parsed = JSON.parse(jsonText);
+      } catch (error) {
+        logger.error("Failed to parse JSON response", { jsonText, error });
+        throw new Error(`Failed to parse ChatGPT response as JSON: ${error}`);
+      }
+
+      // Validate response format
+      if (!validateExpertResponse(parsed)) {
+        logger.error("Invalid response format", { parsed });
+        throw new Error("ChatGPT response does not match expected format");
+      }
+
+      // Check for template response
+      if (isTemplateResponse(parsed)) {
+        if (attempt <= maxTemplateRetries) {
+          logger.warn("Template response detected, will retry", { attempt, maxRetries: maxTemplateRetries });
+          continue;  // Retry with clarification
+        } else {
+          logger.error("Template response persisted after retries", { attempt });
+          throw new Error("ChatGPT returned template format instead of answering. Try again or simplify your question.");
+        }
+      }
+
+      logger.info("Escalation completed successfully");
+      return parsed;
     }
-    logger.debug("Escalation completed", { project: packet.project, conversation: conversationTitle });
 
-    const getResult = escalateResult;
-
-    const responseData = getResult.data as { response: string };
-    const rawResponse = responseData.response;
-    logger.debug("Got raw response", { length: rawResponse.length });
-
-    // Step 7: Parse JSON response
-    const jsonText = extractJson(rawResponse);
-    let parsed: unknown;
-
-    try {
-      parsed = JSON.parse(jsonText);
-    } catch (error) {
-      logger.error("Failed to parse JSON response", { jsonText, error });
-      throw new Error(`Failed to parse ChatGPT response as JSON: ${error}`);
-    }
-
-    // Step 8: Validate response
-    if (!validateExpertResponse(parsed)) {
-      logger.error("Invalid response format", { parsed });
-      throw new Error("ChatGPT response does not match expected format");
-    }
-
-    logger.info("Escalation completed successfully");
-    return parsed;
+    // Should not reach here
+    throw new Error("Escalation failed after all attempts");
   });
 }
 

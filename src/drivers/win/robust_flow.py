@@ -13,6 +13,9 @@ This prevents race conditions and ensures reliable automation.
 import time
 import sys
 import os
+import ctypes
+from contextlib import contextmanager
+from datetime import datetime
 
 # Add driver directory to path
 _driver_dir = os.path.dirname(os.path.abspath(__file__))
@@ -25,9 +28,107 @@ from ocr_extraction import start_ocr_preload
 start_ocr_preload()
 
 
+# Flow start time for elapsed time calculation
+_flow_start_time = None
+
+
 def log_debug(msg: str):
     """Log debug message to stderr."""
     print(f"[FLOW] {msg}", file=sys.stderr)
+
+
+def log_phase(step: int, phase: str, status: str = ""):
+    """
+    Log a phase marker with timestamp and elapsed time.
+    
+    Args:
+        step: Step number (1-10)
+        phase: Phase name (e.g., "open_sidebar", "click_project")
+        status: Status indicator (e.g., "START", "OK", "FAIL", "RETRY")
+    """
+    global _flow_start_time
+    
+    now = datetime.now()
+    timestamp = now.strftime("%H:%M:%S.%f")[:-3]  # HH:MM:SS.mmm
+    
+    if _flow_start_time is None:
+        elapsed = "0.000"
+    else:
+        elapsed = f"{(now.timestamp() - _flow_start_time):.3f}"
+    
+    status_str = f" [{status}]" if status else ""
+    print(f"[PHASE] {timestamp} +{elapsed}s | Step {step} | {phase}{status_str}", file=sys.stderr)
+
+
+def reset_flow_timer():
+    """Reset the flow timer (call at start of execute_full_flow)."""
+    global _flow_start_time
+    _flow_start_time = datetime.now().timestamp()
+
+
+# =============================================================================
+# INPUT BLOCKING: Prevent external interference during automation
+# =============================================================================
+
+_user32 = ctypes.windll.user32
+_input_blocked = False
+
+def block_input(block: bool = True) -> bool:
+    """
+    Block or unblock all mouse and keyboard input.
+    
+    IMPORTANT: Requires admin/elevated privileges to work.
+    If not elevated, this will silently fail (returns False).
+    
+    Args:
+        block: True to block input, False to unblock
+        
+    Returns:
+        True if successful, False if failed (e.g., not admin)
+    """
+    global _input_blocked
+    try:
+        result = _user32.BlockInput(block)
+        if result:
+            _input_blocked = block
+            log_debug(f"[input] {'BLOCKED' if block else 'UNBLOCKED'} user input")
+        else:
+            # BlockInput requires admin privileges
+            log_debug(f"[input] BlockInput failed (need admin privileges?)")
+        return bool(result)
+    except Exception as e:
+        log_debug(f"[input] BlockInput error: {e}")
+        return False
+
+def unblock_input():
+    """Ensure input is unblocked."""
+    global _input_blocked
+    if _input_blocked:
+        block_input(False)
+
+@contextmanager
+def input_blocked():
+    """
+    Context manager to block input during critical operations.
+    
+    Usage:
+        with input_blocked():
+            # Do automation that shouldn't be interrupted
+            pass
+        # Input automatically unblocked when exiting
+    
+    If BlockInput fails (not admin), operations proceed normally.
+    """
+    blocked = block_input(True)
+    try:
+        yield blocked
+    finally:
+        if blocked:
+            block_input(False)
+
+# Register cleanup on exit to ensure input is never left blocked
+import atexit
+atexit.register(unblock_input)
 
 
 class RobustChatGPTFlow:
@@ -40,6 +141,8 @@ class RobustChatGPTFlow:
         self.window_rect = None
         # Allow test harness to disable keyboard fallbacks to avoid global Tab usage in CI
         self._keyboard_fallback_enabled = True
+        # Enable input blocking during critical operations (requires admin)
+        self._block_input_enabled = True
 
     # =========================================================================
     # SAFETY GUARDRAILS: Window State & Focus Management
@@ -174,6 +277,71 @@ class RobustChatGPTFlow:
             log_debug("  [safety] ✗ Could not find ChatGPT window")
             return False
 
+    def _ensure_window_viable(self, step_name: str = "") -> bool:
+        """
+        Comprehensive pre-step validation - ensures window is in a viable state.
+        
+        Call this before EVERY critical step to guard against chaos:
+        1. Verify hwnd is still valid
+        2. Restore from minimized if needed
+        3. Ensure foreground focus
+        4. Update window_rect to handle moves/resizes
+        
+        Args:
+            step_name: Name of the step (for logging)
+            
+        Returns: True if window is viable and ready, False if unrecoverable
+        """
+        import win32gui
+        import win32con
+        
+        prefix = f"[viable:{step_name}]" if step_name else "[viable]"
+        log_debug(f"  {prefix} Pre-step validation...")
+        
+        # 1. Check hwnd validity
+        if not self.hwnd or not win32gui.IsWindow(self.hwnd):
+            log_debug(f"  {prefix} hwnd invalid, refreshing...")
+            if not self._refresh_hwnd():
+                log_debug(f"  {prefix} ✗ Could not refresh hwnd")
+                return False
+        
+        # 2. Restore from minimized
+        if win32gui.IsIconic(self.hwnd):
+            log_debug(f"  {prefix} Window minimized, restoring...")
+            try:
+                win32gui.ShowWindow(self.hwnd, win32con.SW_RESTORE)
+                time.sleep(0.3)
+            except Exception as e:
+                log_debug(f"  {prefix} ✗ Could not restore: {e}")
+                return False
+        
+        # 3. Ensure visible
+        if not win32gui.IsWindowVisible(self.hwnd):
+            log_debug(f"  {prefix} Window not visible, showing...")
+            try:
+                win32gui.ShowWindow(self.hwnd, win32con.SW_SHOW)
+                time.sleep(0.2)
+            except Exception as e:
+                log_debug(f"  {prefix} ✗ Could not show: {e}")
+                return False
+        
+        # 4. Update window rect (handles chaos moving/resizing the window)
+        try:
+            new_rect = win32gui.GetWindowRect(self.hwnd)
+            if new_rect != self.window_rect:
+                log_debug(f"  {prefix} Window rect changed: {self.window_rect} -> {new_rect}")
+                self.window_rect = new_rect
+        except Exception as e:
+            log_debug(f"  {prefix} ⚠ Could not get window rect: {e}")
+        
+        # 5. Ensure foreground
+        if not self._ensure_foreground():
+            log_debug(f"  {prefix} ✗ Could not ensure foreground")
+            return False
+        
+        log_debug(f"  {prefix} ✓ Window viable")
+        return True
+
     def _retry_with_recovery(self, operation, operation_name: str, max_attempts: int = 3):
         """
         Retry an operation with window state recovery.
@@ -252,6 +420,106 @@ class RobustChatGPTFlow:
         except Exception as e:
             log_debug(f"  [safe_click] ✗ Click failed for {description}: {e}")
             return False
+
+    def _verify_prompt_entry(self, expected_prompt: str, max_attempts: int = 3) -> bool:
+        """
+        Verify that the prompt was correctly entered into the input field.
+        
+        Uses Ctrl+A, Ctrl+C to copy current input and compare with expected.
+        Returns True if prompt matches, False otherwise.
+        """
+        import pyperclip
+        from pywinauto.keyboard import send_keys
+        
+        for attempt in range(1, max_attempts + 1):
+            try:
+                # Ensure foreground for clipboard operations
+                if not self._ensure_foreground():
+                    log_debug(f"  [verify] Lost foreground during verification (attempt {attempt})")
+                    time.sleep(0.2)
+                    continue
+                
+                # Select all and copy
+                send_keys('^a')
+                time.sleep(0.1)
+                send_keys('^c')
+                time.sleep(0.15)
+                
+                # Get clipboard content
+                current_text = pyperclip.paste()
+                
+                # Compare (strip whitespace for robustness)
+                expected_clean = expected_prompt.strip()
+                current_clean = current_text.strip() if current_text else ""
+                
+                if current_clean == expected_clean:
+                    log_debug(f"  [verify] ✓ Prompt verified ({len(current_clean)} chars)")
+                    return True
+                else:
+                    # Log mismatch details
+                    expected_len = len(expected_clean)
+                    current_len = len(current_clean)
+                    log_debug(f"  [verify] ✗ Mismatch (attempt {attempt}): expected {expected_len} chars, got {current_len}")
+                    if current_len < expected_len * 0.5:
+                        log_debug(f"  [verify]   Prompt appears truncated (less than 50%)")
+                    elif current_len > expected_len:
+                        log_debug(f"  [verify]   Prompt has extra content")
+                    
+            except Exception as e:
+                log_debug(f"  [verify] Exception during verification: {e}")
+            
+            time.sleep(0.2)
+        
+        return False
+
+    def _is_template_response(self, response: dict) -> bool:
+        """
+        Detect if ChatGPT returned the template/format instructions instead of a real answer.
+        
+        Common template patterns:
+        - guidance contains placeholder like "one-sentence summary"
+        - priority is "low | medium | high" (the template text)
+        - action_plan contains generic steps like "step 1", "step 2"
+        """
+        if not isinstance(response, dict):
+            return False
+        
+        # Check for template priority (should be one of: low, medium, high - not all three)
+        priority = response.get("priority", "")
+        if "|" in str(priority):
+            log_debug("  [template-check] Detected template priority: contains '|'")
+            return True
+        
+        # Check for template guidance phrases
+        guidance = response.get("guidance", "")
+        template_guidance_phrases = [
+            "one-sentence summary",
+            "your main guidance",
+            "explanation here",
+            "what the agent should do",
+        ]
+        guidance_lower = guidance.lower()
+        for phrase in template_guidance_phrases:
+            if phrase in guidance_lower:
+                log_debug(f"  [template-check] Detected template guidance: '{phrase}'")
+                return True
+        
+        # Check for template action_plan
+        action_plan = response.get("action_plan", [])
+        if isinstance(action_plan, list) and len(action_plan) > 0:
+            template_plan_phrases = ["step 1", "step 2", "step 3", "action 1", "action 2"]
+            for step in action_plan:
+                step_lower = str(step).lower().strip()
+                if step_lower in template_plan_phrases:
+                    log_debug(f"  [template-check] Detected template action_plan step: '{step}'")
+                    return True
+        
+        # Check for notes_for_darien (wrong field name from template)
+        if "notes_for_darien" in response:
+            log_debug("  [template-check] Detected wrong field name: notes_for_darien")
+            return True
+        
+        return False
 
     
     # =========================================================================
@@ -518,16 +786,20 @@ class RobustChatGPTFlow:
         from PIL import ImageGrab
         import numpy as np
         
+        log_phase(4, "open_sidebar", "START")
         log_debug("STEP 4: Opening sidebar...")
         
-        if not self.hwnd or not self.window_rect:
-            log_debug("  ✗ FAILED: No window")
+        # Pre-step validation
+        if not self._ensure_window_viable("step4"):
+            log_phase(4, "open_sidebar", "FAIL:not_viable")
+            log_debug("  ✗ FAILED: Window not viable")
             return False
         
         rect = self.window_rect
         
         # First check if sidebar is already open
         if self._is_sidebar_open():
+            log_phase(4, "open_sidebar", "OK:already_open")
             log_debug("  ✓ Sidebar already open")
             return True
         
@@ -538,6 +810,7 @@ class RobustChatGPTFlow:
         log_debug(f"  Clicking hamburger at ({menu_x}, {menu_y})")
         # Safe click with foreground verification
         if not self._safe_click(menu_x, menu_y, "hamburger menu"):
+            log_phase(4, "open_sidebar", "FAIL:click_failed")
             log_debug("  ✗ FAILED: Could not click hamburger menu")
             return False
         
@@ -547,9 +820,11 @@ class RobustChatGPTFlow:
             time.sleep(0.3)
             
             if self._is_sidebar_open():
+                log_phase(4, "open_sidebar", "OK")
                 log_debug("  ✓ VERIFIED: Sidebar is open")
                 return True
         
+        log_phase(4, "open_sidebar", "FAIL:timeout")
         log_debug("  ✗ FAILED: Sidebar not detected after click")
         return False
     
@@ -597,7 +872,14 @@ class RobustChatGPTFlow:
         """
         import win32gui
         
+        log_phase(5, f"click_project:{project_name}", "START")
         log_debug(f"STEP 5: Clicking project '{project_name}'...")
+        
+        # Pre-step validation
+        if not self._ensure_window_viable("step5"):
+            log_phase(5, f"click_project:{project_name}", "FAIL:not_viable")
+            log_debug("  ✗ FAILED: Window not viable")
+            return False
         
         # Retry logic for chaos resilience
         max_attempts = 3
@@ -609,6 +891,7 @@ class RobustChatGPTFlow:
                 continue
                 
             if attempt > 0:
+                log_phase(5, f"click_project:{project_name}", f"RETRY:{attempt+1}")
                 log_debug(f"  Retry attempt {attempt + 1}/{max_attempts}...")
                 time.sleep(0.5)
             
@@ -619,11 +902,13 @@ class RobustChatGPTFlow:
                 time.sleep(0.5)
                 title = win32gui.GetWindowText(self.hwnd)
                 if project_name.lower() in title.lower():
+                    log_phase(5, f"click_project:{project_name}", "OK:title_match")
                     log_debug(f"  ✓ VERIFIED: Window title is '{title}'")
                     return True
 
                 # Title may not change; validate via hover detection + OCR nearest text
                 if self._verify_sidebar_selection(project_name):
+                    log_phase(5, f"click_project:{project_name}", "OK:hover_match")
                     log_debug("  ✓ VERIFIED: Hover/OCR matches intended project")
                     return True
 
@@ -631,6 +916,7 @@ class RobustChatGPTFlow:
                 # Continue to next attempt instead of returning False immediately
                 continue
         
+        log_phase(5, f"click_project:{project_name}", "FAIL:not_found")
         log_debug(f"  ✗ FAILED: Could not find/click '{project_name}' after {max_attempts} attempts")
         return False
 
@@ -708,7 +994,14 @@ class RobustChatGPTFlow:
         """
         import win32gui
         
+        log_phase(6, f"click_conversation:{conversation_name}", "START")
         log_debug(f"STEP 6: Clicking conversation '{conversation_name}'...")
+        
+        # Pre-step validation
+        if not self._ensure_window_viable("step6"):
+            log_phase(6, f"click_conversation:{conversation_name}", "FAIL:not_viable")
+            log_debug("  ✗ FAILED: Window not viable")
+            return False
         
         # Retry logic for chaos resilience
         max_attempts = 3
@@ -720,6 +1013,7 @@ class RobustChatGPTFlow:
                 continue
                 
             if attempt > 0:
+                log_phase(6, f"click_conversation:{conversation_name}", f"RETRY:{attempt+1}")
                 log_debug(f"  Retry attempt {attempt + 1}/{max_attempts}...")
                 time.sleep(0.5)
             
@@ -733,13 +1027,16 @@ class RobustChatGPTFlow:
                 
                 # Fuzzy check
                 if self._fuzzy_match(conversation_name, title):
+                    log_phase(6, f"click_conversation:{conversation_name}", "OK:title_match")
                     log_debug(f"  ✓ VERIFIED: Window title is '{title}'")
                     return True
                 else:
+                    log_phase(6, f"click_conversation:{conversation_name}", "OK:no_title_verify")
                     log_debug(f"  ⚠ Click done but title='{title}' doesn't match '{conversation_name}'")
                     # Still return true - might be OK
                     return True
         
+        log_phase(6, f"click_conversation:{conversation_name}", "FAIL:not_found")
         log_debug(f"  ✗ FAILED: Could not find/click '{conversation_name}' after {max_attempts} attempts")
         return False
     
@@ -884,9 +1181,11 @@ class RobustChatGPTFlow:
         """
         Scan PROJECT VIEW (main content area) looking for conversation.
         After clicking a project, conversations appear in center, not sidebar.
+        
+        Includes scroll-and-retry logic for when target is below visible area.
         """
         import win32api
-        from pywinauto.mouse import click
+        from pywinauto.mouse import click, scroll
         from PIL import ImageGrab
         import tempfile
         import os
@@ -901,69 +1200,99 @@ class RobustChatGPTFlow:
         window_height = rect[3] - rect[1]
         
         # Project view: conversations are in the CENTER of the window
-        # Based on screenshot: roughly from x=120 to x=750, y=180 to y=400
-        # As percentage of window: x=15% to 85%, y=25% to 70%
+        # Expanded scan area to catch items lower in the list
+        # x=10% to 90%, y=20% to 85% (was 30% to 75%)
         
-        content_left = rect[0] + int(window_width * 0.12)
-        content_right = rect[0] + int(window_width * 0.88)
-        content_top = rect[1] + int(window_height * 0.30)
-        content_bottom = rect[1] + int(window_height * 0.75)
+        content_left = rect[0] + int(window_width * 0.10)
+        content_right = rect[0] + int(window_width * 0.90)
+        content_top = rect[1] + int(window_height * 0.20)
+        content_bottom = rect[1] + int(window_height * 0.85)
         
-        log_debug(f"  Scanning project view for '{target}'...")
-        log_debug(f"  Content area: ({content_left}, {content_top}) to ({content_right}, {content_bottom})")
+        # Center point for scrolling
+        scroll_x = rect[0] + int(window_width * 0.5)
+        scroll_y = rect[1] + int(window_height * 0.5)
         
-        # Ensure foreground before screenshot - critical for chaos resilience
-        if not self._ensure_foreground():
-            log_debug(f"  ✗ Could not ensure foreground for project view screenshot")
-            return False
+        max_scroll_attempts = 5  # Try scrolling down up to 5 times (chaos can create many conversations)
         
-        # Capture the content area
-        try:
-            screenshot = ImageGrab.grab(bbox=(content_left, content_top, content_right, content_bottom))
-            
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-                temp_path = f.name
-                screenshot.save(temp_path)
-            
-            results = ocr.predict(temp_path)
-            os.unlink(temp_path)
-            
-            # Find all text items
-            for res in results:
-                if 'rec_texts' not in res or 'rec_boxes' not in res:
+        for scroll_attempt in range(max_scroll_attempts + 1):
+            if scroll_attempt == 1:
+                # First scroll: scroll to TOP to start fresh, then search from there
+                log_debug(f"  Scrolling to TOP first to find target...")
+                if self._ensure_foreground():
+                    win32api.SetCursorPos((scroll_x, scroll_y))
+                    time.sleep(0.1)
+                    # Scroll up a lot to get to top
+                    for _ in range(3):
+                        scroll(coords=(scroll_x, scroll_y), wheel_dist=5)  # Scroll up
+                        time.sleep(0.2)
+                    time.sleep(0.3)
+            elif scroll_attempt > 1:
+                log_debug(f"  Scrolling down (attempt {scroll_attempt - 1}/{max_scroll_attempts - 1})...")
+                # Scroll down to reveal more items
+                if not self._ensure_foreground():
+                    log_debug(f"  ✗ Could not ensure foreground for scroll")
                     continue
+                win32api.SetCursorPos((scroll_x, scroll_y))
+                time.sleep(0.1)
+                scroll(coords=(scroll_x, scroll_y), wheel_dist=-5)  # Scroll down more aggressively
+                time.sleep(0.5)  # Wait for UI to update
+            
+            log_debug(f"  Scanning project view for '{target}'...")
+            log_debug(f"  Content area: ({content_left}, {content_top}) to ({content_right}, {content_bottom})")
+            
+            # Ensure foreground before screenshot - critical for chaos resilience
+            if not self._ensure_foreground():
+                log_debug(f"  ✗ Could not ensure foreground for project view screenshot")
+                continue
+            
+            # Capture the content area
+            try:
+                screenshot = ImageGrab.grab(bbox=(content_left, content_top, content_right, content_bottom))
                 
-                texts = res['rec_texts']
-                boxes = res['rec_boxes']
-                scores = res.get('rec_scores', [1.0] * len(texts))
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                    temp_path = f.name
+                    screenshot.save(temp_path)
                 
-                for text, box, score in zip(texts, boxes, scores):
-                    # Check if this matches our target
-                    match_score = similarity_ratio(target.lower(), text.lower())
+                results = ocr.predict(temp_path)
+                os.unlink(temp_path)
+                
+                # Find all text items
+                for res in results:
+                    if 'rec_texts' not in res or 'rec_boxes' not in res:
+                        continue
                     
-                    if match_score >= 0.7 or target.lower() in text.lower():
-                        log_debug(f"    FOUND '{text}' (match={match_score:.2f})")
+                    texts = res['rec_texts']
+                    boxes = res['rec_boxes']
+                    scores = res.get('rec_scores', [1.0] * len(texts))
+                    
+                    for text, box, score in zip(texts, boxes, scores):
+                        # Check if this matches our target
+                        match_score = similarity_ratio(target.lower(), text.lower())
                         
-                        # Calculate click position from box
-                        # Box is in screenshot coordinates, need to add content_left/top
-                        box_center_x = (box[0] + box[2]) / 2
-                        box_center_y = (box[1] + box[3]) / 2
-                        
-                        click_x = int(content_left + box_center_x)
-                        click_y = int(content_top + box_center_y)
-                        
-                        log_debug(f"    Clicking at ({click_x}, {click_y})")
-                        # Safe click with foreground verification
-                        return self._safe_click(click_x, click_y, f"project item '{target}'")
-                    else:
-                        log_debug(f"    '{text}' (match={match_score:.2f}) - no match")
-            
-            log_debug(f"  Target '{target}' not found in project view")
-            return False
-            
-        except Exception as e:
-            log_debug(f"  Error scanning project view: {e}")
-            return False
+                        if match_score >= 0.7 or target.lower() in text.lower():
+                            log_debug(f"    FOUND '{text}' (match={match_score:.2f})")
+                            
+                            # Calculate click position from box
+                            # Box is in screenshot coordinates, need to add content_left/top
+                            box_center_x = (box[0] + box[2]) / 2
+                            box_center_y = (box[1] + box[3]) / 2
+                            
+                            click_x = int(content_left + box_center_x)
+                            click_y = int(content_top + box_center_y)
+                            
+                            log_debug(f"    Clicking at ({click_x}, {click_y})")
+                            # Safe click with foreground verification
+                            return self._safe_click(click_x, click_y, f"project item '{target}'")
+                        else:
+                            log_debug(f"    '{text}' (match={match_score:.2f}) - no match")
+                
+                log_debug(f"  Target '{target}' not found in current view")
+                
+            except Exception as e:
+                log_debug(f"  Error scanning project view: {e}")
+        
+        log_debug(f"  Target '{target}' not found after {max_scroll_attempts} scroll attempts")
+        return False
     
     def _capture_sidebar(self):
         """Capture sidebar region."""
@@ -1206,18 +1535,26 @@ class RobustChatGPTFlow:
         log_debug("[focus] ✗ FAILED: could not focus input after all strategies")
         return False
 
-    def step7_send_prompt(self, prompt: str) -> bool:
-        """Focus input (ensure_input_focus) then readiness probe and send prompt."""
+    def step7_send_prompt(self, prompt: str, verify_entry: bool = True) -> bool:
+        """Focus input (ensure_input_focus) then readiness probe and send prompt.
+        
+        Args:
+            prompt: The prompt text to send
+            verify_entry: If True, verify prompt was entered correctly before sending
+        """
+        log_phase(7, "send_prompt", "START")
         log_debug("STEP 7+8: Focus & Send Prompt...")
         from pywinauto.mouse import click
         import win32gui
         
-        # Ensure foreground before any UI interaction
-        if not self._ensure_foreground():
-            log_debug("  ✗ Could not ensure foreground before sending prompt")
+        # Pre-step validation
+        if not self._ensure_window_viable("step7"):
+            log_phase(7, "send_prompt", "FAIL:not_viable")
+            log_debug("  ✗ FAILED: Window not viable")
             return False
             
         if not self.ensure_input_focus():
+            log_phase(7, "send_prompt", "FAIL:no_focus")
             return False
         # Determine input center for re-clicks
         rect = self.window_rect
@@ -1252,9 +1589,21 @@ class RobustChatGPTFlow:
             time.sleep(0.12)
             try:
                 if not self._is_generating():
-                    log_debug("  Idle (arrow) detected — sending prompt")
+                    log_debug("  Idle (arrow) detected — entering prompt")
                     
-                    # Final foreground check before sending
+                    # === CRITICAL SECTION: Prompt Entry with Verification ===
+                    # This is the timing-critical part - maintain focus throughout
+                    
+                    # Step 1: Clear any existing text
+                    if not self._ensure_foreground():
+                        log_debug("   Lost foreground before clear, retrying...")
+                        continue
+                    send_keys('^a')  # Select all
+                    time.sleep(0.05)
+                    send_keys('{DELETE}')  # Clear
+                    time.sleep(0.1)
+                    
+                    # Step 2: Paste prompt
                     if not self._ensure_foreground():
                         log_debug("   Lost foreground before paste, retrying...")
                         continue
@@ -1262,15 +1611,36 @@ class RobustChatGPTFlow:
                     pyperclip.copy(prompt)
                     time.sleep(0.06)
                     send_keys('^v')
-                    time.sleep(0.12)
+                    time.sleep(0.15)
+                    
+                    # Step 3: Verify prompt entry (if enabled)
+                    if verify_entry:
+                        if not self._verify_prompt_entry(prompt):
+                            log_debug("   ✗ Prompt verification failed, clearing and retrying...")
+                            # Clear and retry
+                            send_keys('^a')
+                            time.sleep(0.05)
+                            send_keys('{DELETE}')
+                            time.sleep(0.2)
+                            continue
+                    
+                    # Step 4: Send the prompt
+                    if not self._ensure_foreground():
+                        log_debug("   Lost foreground before Enter, retrying...")
+                        continue
+                        
                     send_keys('{ENTER}')
                     time.sleep(0.4)
+                    
+                    # === END CRITICAL SECTION ===
+                    
                     if previous_clipboard is not None:
                         try:
                             pyperclip.copy(previous_clipboard)
                         except Exception:
                             pass
-                    log_debug("  ✓ Prompt sent")
+                    log_phase(7, "send_prompt", "OK")
+                    log_debug("  ✓ Prompt sent (verified)" if verify_entry else "  ✓ Prompt sent")
                     return True
             except Exception:
                 pass
@@ -1284,6 +1654,7 @@ class RobustChatGPTFlow:
                 pyperclip.copy(previous_clipboard)
             except Exception:
                 pass
+        log_phase(7, "send_prompt", "FAIL:timeout")
         log_debug("  ✗ FAILED: Prompt not sent after readiness attempts")
         return False
     
@@ -1300,12 +1671,22 @@ class RobustChatGPTFlow:
         """
         Wait for ChatGPT to finish generating.
         
-        Detection: Black stop button visible = generating, waveform = idle.
+        Detection: 
+        - 'generating' (stop button) = still generating
+        - 'idle' (waveform) = complete, input empty
+        - 'ready' (arrow) = chaos typed text, need to clear input
         """
         from PIL import ImageGrab
         import numpy as np
         
+        log_phase(9, "wait_for_response", "START")
         log_debug("STEP 9: Waiting for response...")
+        
+        # Pre-step validation
+        if not self._ensure_window_viable("step9"):
+            log_phase(9, "wait_for_response", "FAIL:not_viable")
+            log_debug("  ✗ FAILED: Window not viable")
+            return False
         
         start_time = time.time()
         
@@ -1315,7 +1696,7 @@ class RobustChatGPTFlow:
         generation_started = False
         consecutive_idle = 0
         foreground_failures = 0
-        max_foreground_failures = 10
+        max_foreground_failures = 20  # Increased tolerance for chaos
         
         while (time.time() - start_time) < timeout:
             # Ensure window is visible/foreground for screenshot
@@ -1323,54 +1704,82 @@ class RobustChatGPTFlow:
                 foreground_failures += 1
                 log_debug(f"  ⚠ Lost foreground ({foreground_failures}/{max_foreground_failures})")
                 if foreground_failures >= max_foreground_failures:
+                    log_phase(9, "wait_for_response", "FAIL:foreground_lost")
                     log_debug(f"  ✗ Too many foreground failures, aborting wait")
                     return False
                 time.sleep(0.5)
                 continue
             
-            is_gen = self._is_generating()
+            # Get detailed button state
+            state = self._get_input_button_state()
+            elapsed = time.time() - start_time
             
-            if is_gen:
+            if state == 'generating':
                 generation_started = True
                 consecutive_idle = 0
                 foreground_failures = 0  # Reset on success
-                elapsed = time.time() - start_time
                 log_debug(f"  [{elapsed:.0f}s] GENERATING (stop button visible)")
-            else:
+                
+            elif state == 'ready':
+                # Arrow visible - chaos typed text into input
+                # This could happen during or after generation
+                log_debug(f"  [{elapsed:.0f}s] ARROW detected - chaos text in input")
+                foreground_failures = 0  # Reset on success
+                
+                # Don't count this as idle - clear the input first
+                self._clear_input_if_needed()
+                # Don't increment consecutive_idle - we need to recheck after clearing
+                time.sleep(0.3)
+                continue
+                
+            elif state == 'idle':
                 consecutive_idle += 1
                 foreground_failures = 0  # Reset on success
-                elapsed = time.time() - start_time
                 log_debug(f"  [{elapsed:.0f}s] IDLE (waveform visible) - consecutive: {consecutive_idle}")
                 
                 # Need several consecutive idle readings after generation started
                 if generation_started and consecutive_idle >= 3:
+                    log_phase(9, "wait_for_response", f"OK:{elapsed:.0f}s")
                     log_debug(f"  ✓ VERIFIED: Response complete after {elapsed:.0f}s")
                     return True
                 
                 # If we never saw generation start but see idle for a while,
                 # maybe response was very fast or already done
                 if not generation_started and consecutive_idle >= 5:
+                    log_phase(9, "wait_for_response", f"OK:no_gen:{elapsed:.0f}s")
                     log_debug(f"  ✓ Response appears complete (no generation detected)")
                     return True
+            else:
+                # Unknown state
+                log_debug(f"  [{elapsed:.0f}s] UNKNOWN state: {state}")
             
             time.sleep(0.5)
         
+        log_phase(9, "wait_for_response", f"FAIL:timeout:{timeout}s")
         log_debug(f"  ✗ TIMEOUT after {timeout}s")
         return False
     
-    def _is_generating(self) -> bool:
-        """Check if ChatGPT is generating by looking for black stop button."""
+    def _get_input_button_state(self) -> str:
+        """
+        Detect the state of the input button (stop/waveform/arrow).
+        
+        Returns:
+            'generating' - Black stop button visible (ChatGPT is generating)
+            'idle' - Waveform icon visible (input empty, ready for input)
+            'ready' - Arrow icon visible (text in input, ready to send)
+            'unknown' - Could not determine state
+        """
         from PIL import ImageGrab
         import numpy as np
         
         if not self.window_rect:
-            return False
+            return 'unknown'
         
         rect = self.window_rect
         window_width = rect[2] - rect[0]
         window_height = rect[3] - rect[1]
         
-        # Stop/waveform button at bottom-right of input box
+        # Stop/waveform/arrow button at bottom-right of input box
         center_x = rect[0] + int(window_width * 0.83)
         center_y = rect[1] + int(window_height * 0.87)
         
@@ -1380,21 +1789,74 @@ class RobustChatGPTFlow:
             img = ImageGrab.grab(bbox=area)
             pixels = np.array(img)
             
-            # Count very dark pixels (the black stop square)
+            # Count very dark pixels (black elements)
             dark_pixels = np.sum(np.all(pixels < 50, axis=2))
             
-            # Stop button: 60-400 dark pixels (black square on white)
-            # Waveform (idle): <60 dark pixels
-            # Arrow (ready): >400 dark pixels (not expected during wait)
-            return 60 < dark_pixels < 400
-        except:
-            return False
+            # Stop button (generating): 60-400 dark pixels (black square on white)
+            # Waveform (idle, empty input): <60 dark pixels (thin wavy lines)
+            # Arrow (ready, text in input): >400 dark pixels (filled black arrow)
+            
+            if 60 < dark_pixels < 400:
+                return 'generating'
+            elif dark_pixels >= 400:
+                return 'ready'  # Arrow - text in input
+            else:
+                return 'idle'  # Waveform - empty input
+        except Exception as e:
+            log_debug(f"  [button-state] Error: {e}")
+            return 'unknown'
+    
+    def _clear_input_if_needed(self) -> bool:
+        """
+        Clear the input field if chaos has typed text into it.
+        
+        Returns True if input is now clear (or was already clear).
+        """
+        from pywinauto.keyboard import send_keys
+        
+        state = self._get_input_button_state()
+        if state == 'ready':
+            # Text in input (arrow visible) - clear it
+            log_debug("  [clear-input] Chaos text detected in input, clearing...")
+            if not self._ensure_foreground():
+                return False
+            
+            # Click input area first
+            rect = self.window_rect
+            if rect:
+                window_width = rect[2] - rect[0]
+                window_height = rect[3] - rect[1]
+                input_x = rect[0] + int(window_width * 0.5)
+                input_y = rect[1] + int(window_height * 0.83)
+                self._safe_click(input_x, input_y, "clear input click")
+                time.sleep(0.1)
+            
+            # Select all and delete
+            send_keys('^a')
+            time.sleep(0.05)
+            send_keys('{DELETE}')
+            time.sleep(0.2)
+            
+            # Verify it's cleared
+            new_state = self._get_input_button_state()
+            if new_state == 'idle':
+                log_debug("  [clear-input] ✓ Input cleared")
+                return True
+            else:
+                log_debug(f"  [clear-input] ✗ Input still not clear: {new_state}")
+                return False
+        
+        return True  # Already clear or generating
+    
+    def _is_generating(self) -> bool:
+        """Check if ChatGPT is generating by looking for black stop button."""
+        return self._get_input_button_state() == 'generating'
     
     # =========================================================================
     # STEP 10: Copy Response
     # =========================================================================
     
-    def step10_copy_response(self) -> str:
+    def step10_copy_response(self, max_outer_attempts: int = 3) -> str:
         """
         Copy the last response to clipboard.
         
@@ -1404,6 +1866,8 @@ class RobustChatGPTFlow:
         3. Validate focused element is Copy button before pressing Enter
         4. If not on Copy, continue Shift+Tab with validation
         5. Fallback to UIA direct invoke
+        
+        Uses outer retry loop to handle chaos interruptions.
         """
         import pyperclip
         from pywinauto.keyboard import send_keys
@@ -1411,6 +1875,11 @@ class RobustChatGPTFlow:
         import win32gui
         
         log_debug("STEP 10: Copying response...")
+        
+        # Pre-step validation
+        if not self._ensure_window_viable("step10"):
+            log_debug("  ✗ FAILED: Window not viable")
+            return ""
         
         # Helper to get focused element info via UIA
         def get_focused_button_name() -> str:
@@ -1439,11 +1908,37 @@ class RobustChatGPTFlow:
                 log_debug(f"[copy] get_focused_button_name error: {e}")
                 return ""
         
-        # Simple click on input area as anchor
-        rect = self.window_rect
-        if rect:
+        def inner_copy_attempt() -> str:
+            """Single attempt at copying the response."""
+            rect = self.window_rect
+            if not rect:
+                return ""
+            
             window_width = rect[2] - rect[0]
             window_height = rect[3] - rect[1]
+            
+            # CRITICAL: Scroll to bottom of conversation first!
+            # Chaos may have scrolled up or clicked on old messages
+            log_debug("[copy] Scrolling to bottom of conversation...")
+            if self._ensure_foreground():
+                # Click in the conversation area (not input) to focus it
+                conv_x = rect[0] + int(window_width * 0.5)
+                conv_y = rect[1] + int(window_height * 0.5)  # Middle of window = conversation area
+                self._safe_click(conv_x, conv_y, "conversation area")
+                time.sleep(0.2)
+                
+                # Send Ctrl+End to jump to absolute bottom
+                send_keys('^{END}')
+                time.sleep(0.3)
+                
+                # Also send End key a few times for good measure
+                for _ in range(3):
+                    send_keys('{END}')
+                    time.sleep(0.1)
+                
+                log_debug("[copy] ✓ Scrolled to bottom")
+            
+            # Now click on input area as anchor point
             input_x = rect[0] + int(window_width * 0.5)
             input_y = rect[1] + int(window_height * 0.83)
             
@@ -1452,15 +1947,15 @@ class RobustChatGPTFlow:
                 log_debug(f"[copy] Clicked anchor at ({input_x}, {input_y})")
             else:
                 log_debug(f"[copy] ✗ Anchor click failed")
-        
-        # Strategy 1: Shift+Tab × 5 to reach Copy, then validate and Enter
-        log_debug("[copy] Navigating with Shift+Tab × 5...")
-        
-        # Ensure foreground before keyboard navigation
-        if not self._ensure_foreground():
-            log_debug("[copy] ✗ Could not ensure foreground for Shift+Tab navigation")
-            # Try fallback below
-        else:
+            
+            # Strategy 1: Shift+Tab × 5 to reach Copy, then validate and Enter
+            log_debug("[copy] Navigating with Shift+Tab × 5...")
+            
+            # Ensure foreground before keyboard navigation
+            if not self._ensure_foreground():
+                log_debug("[copy] ✗ Could not ensure foreground for Shift+Tab navigation")
+                return ""
+            
             # Do 5 Shift+Tabs to reach Copy button area
             for i in range(5):
                 send_keys("+{TAB}")
@@ -1483,15 +1978,15 @@ class RobustChatGPTFlow:
                         log_debug(f"[copy] ✓ Got {len(response)} chars")
                         return response
         
-        # Not on Copy — maybe need more tabs. Continue with validation.
-        # Dangerous buttons to avoid: thumbs up, thumbs down, refresh, ...
-        dangerous = ['thumb', 'dislike', 'like', 'refresh', 'regenerate', 'more']
-        
-        # Ensure still foreground before additional tabs
-        if not self._ensure_foreground():
-            log_debug("[copy] ✗ Lost foreground before additional tab navigation")
-            # Skip to UIA fallback
-        else:
+            # Not on Copy — maybe need more tabs. Continue with validation.
+            # Dangerous buttons to avoid: thumbs up, thumbs down, refresh, ...
+            dangerous = ['thumb', 'dislike', 'like', 'refresh', 'regenerate', 'more']
+            
+            # Ensure still foreground before additional tabs
+            if not self._ensure_foreground():
+                log_debug("[copy] ✗ Lost foreground before additional tab navigation")
+                return ""
+            
             max_extra_tabs = 6
             for i in range(max_extra_tabs):
                 send_keys("+{TAB}")
@@ -1520,59 +2015,134 @@ class RobustChatGPTFlow:
                     # Not on a button, might have overshot
                     log_debug(f"[copy] Lost button focus, stopping tab navigation")
                     break
+            
+            # Fallback: Try UIA direct invoke
+            log_debug("[copy] Tab navigation failed, trying UIA direct invoke...")
+            try:
+                from pywinauto import Application
+                app = Application(backend='uia').connect(handle=self.hwnd)
+                main_win = app.window(handle=self.hwnd)
+                buttons = main_win.descendants(control_type='Button')
+                for b in buttons:
+                    try:
+                        name = (b.element_info.name or "").lower()
+                        if 'copy' in name:
+                            log_debug(f"[copy] UIA found Copy button: {name} - invoking")
+                            pyperclip.copy("")
+                            try:
+                                b.invoke()
+                            except Exception:
+                                b.click_input()
+                            time.sleep(0.4)
+                            resp = pyperclip.paste()
+                            if resp and len(resp) > 5:
+                                log_debug(f"[copy] ✓ Got {len(resp)} chars via UIA")
+                                return resp
+                    except Exception:
+                        continue
+            except Exception as e:
+                log_debug(f"[copy] UIA fallback failed: {e}")
+            
+            # Last resort: Ctrl+Shift+C
+            log_debug("[copy] Trying Ctrl+Shift+C...")
+            if self._ensure_foreground():
+                pyperclip.copy("")
+                send_keys("^+c")
+                time.sleep(0.5)
+                response = pyperclip.paste()
+                if response and len(response) > 5:
+                    log_debug(f"[copy] ✓ Got {len(response)} chars via Ctrl+Shift+C")
+                    return response
+            
+            return ""
         
-        # Fallback: Try UIA direct invoke
-        log_debug("[copy] Tab navigation failed, trying UIA direct invoke...")
-        try:
-            from pywinauto import Application
-            app = Application(backend='uia').connect(handle=self.hwnd)
-            main_win = app.window(handle=self.hwnd)
-            buttons = main_win.descendants(control_type='Button')
-            for b in buttons:
-                try:
-                    name = (b.element_info.name or "").lower()
-                    if 'copy' in name:
-                        log_debug(f"[copy] UIA found Copy button: {name} - invoking")
-                        pyperclip.copy("")
-                        try:
-                            b.invoke()
-                        except Exception:
-                            b.click_input()
-                        time.sleep(0.4)
-                        resp = pyperclip.paste()
-                        if resp and len(resp) > 5:
-                            log_debug(f"[copy] ✓ Got {len(resp)} chars via UIA")
-                            return resp
-                except Exception:
-                    continue
-        except Exception as e:
-            log_debug(f"[copy] UIA fallback failed: {e}")
+        # Outer retry loop for chaos resilience
+        for attempt in range(1, max_outer_attempts + 1):
+            log_debug(f"[copy] Outer attempt {attempt}/{max_outer_attempts}")
+            
+            # Ensure window is ready before attempt
+            if not self._ensure_foreground():
+                log_debug(f"[copy] Could not ensure foreground for attempt {attempt}")
+                time.sleep(0.5)
+                continue
+            
+            result = inner_copy_attempt()
+            if result:
+                log_phase(10, "copy_response", f"OK:{len(result)}chars")
+                return result
+            
+            log_debug(f"[copy] Attempt {attempt} failed, waiting before retry...")
+            time.sleep(0.5 * attempt)  # Exponential backoff
         
-        # Last resort: Ctrl+Shift+C
-        log_debug("[copy] Trying Ctrl+Shift+C...")
-        pyperclip.copy("")
-        send_keys("^+c")
-        time.sleep(0.5)
-        response = pyperclip.paste()
-        if response and len(response) > 5:
-            log_debug(f"[copy] ✓ Got {len(response)} chars via Ctrl+Shift+C")
-            return response
-        
-        log_debug("[copy] ✗ FAILED: Could not copy response")
+        log_phase(10, "copy_response", "FAIL:no_content")
+        log_debug("[copy] ✗ FAILED: Could not copy response after all attempts")
         return ""
     
     # =========================================================================
     # FULL FLOW
     # =========================================================================
     
+    def _is_valid_json_response(self, response: str) -> bool:
+        """
+        Check if response looks like a valid JSON response from ChatGPT.
+        
+        This catches cases where chaos sent a new prompt and we copied
+        the wrong response (e.g., "Still here. Still stable.")
+        
+        Returns True if response appears to be valid JSON with expected fields.
+        """
+        import json
+        
+        if not response or len(response) < 20:
+            log_debug("[validate] Response too short")
+            return False
+        
+        # Try to find JSON in the response (might have markdown wrapping)
+        json_text = response.strip()
+        
+        # Remove markdown code blocks if present
+        if json_text.startswith("```"):
+            lines = json_text.split("\n")
+            # Remove first and last lines (```json and ```)
+            json_lines = [l for l in lines if not l.strip().startswith("```")]
+            json_text = "\n".join(json_lines)
+        
+        try:
+            parsed = json.loads(json_text)
+            
+            # Check for expected fields
+            if isinstance(parsed, dict):
+                # Must have at least 'guidance' or 'action_plan' or 'priority'
+                expected_fields = ['guidance', 'action_plan', 'priority']
+                has_expected = any(field in parsed for field in expected_fields)
+                
+                if has_expected:
+                    log_debug(f"[validate] ✓ Valid JSON with expected fields")
+                    return True
+                else:
+                    log_debug(f"[validate] ✗ JSON but missing expected fields: {list(parsed.keys())}")
+                    return False
+            else:
+                log_debug(f"[validate] ✗ JSON but not a dict: {type(parsed)}")
+                return False
+                
+        except json.JSONDecodeError as e:
+            log_debug(f"[validate] ✗ Not valid JSON: {e}")
+            log_debug(f"[validate]   First 100 chars: {response[:100]}")
+            return False
+    
     def execute_full_flow(
         self,
         project_name: str,
         conversation_name: str,
-        prompt: str
+        prompt: str,
+        max_response_retries: int = 2
     ) -> dict:
         """
         Execute the complete flow with verification at each step.
+        
+        Includes retry logic if the copied response looks like "trash"
+        (e.g., chaos sent a new prompt and we copied that response).
         
         Returns:
             {
@@ -1582,62 +2152,129 @@ class RobustChatGPTFlow:
                 "failed_step": int (if failed)
             }
         """
-        log_debug("=" * 60)
-        log_debug("EXECUTING FULL FLOW")
-        log_debug(f"  Project: {project_name}")
-        log_debug(f"  Conversation: {conversation_name}")
-        log_debug(f"  Prompt: {prompt[:50]}...")
-        log_debug("=" * 60)
+        # Reset flow timer for elapsed time tracking
+        reset_flow_timer()
         
-        # Step 1: Kill ChatGPT
-        if not self.step1_kill_chatgpt():
-            return {"success": False, "error": "Failed to kill ChatGPT", "failed_step": 1}
-        
-        time.sleep(1.0)  # Extra wait after kill
-        
-        # Step 2: Start ChatGPT
-        if not self.step2_start_chatgpt():
-            return {"success": False, "error": "Failed to start ChatGPT", "failed_step": 2}
-        
-        # Step 3: Focus ChatGPT
-        if not self.step3_focus_chatgpt():
-            return {"success": False, "error": "Failed to focus ChatGPT", "failed_step": 3}
-        
-        # Step 4: Open Sidebar
-        if not self.step4_open_sidebar():
-            return {"success": False, "error": "Failed to open sidebar", "failed_step": 4}
-        
-        # Step 5: Click Project
-        if not self.step5_click_project(project_name):
-            return {"success": False, "error": f"Failed to find project '{project_name}'", "failed_step": 5}
-        
-        time.sleep(0.5)  # Wait for project to expand
-        
-        # Step 6: Click Conversation
-        if not self.step6_click_conversation(conversation_name):
-            return {"success": False, "error": f"Failed to find conversation '{conversation_name}'", "failed_step": 6}
-        
-        # Step 7+8: Focus & Send Prompt
-        if not self.step7_send_prompt(prompt):
-            return {"success": False, "error": "Failed to focus/send prompt", "failed_step": 7}
-        
-        # Step 9: Wait for Response
-        if not self.step9_wait_for_response():
-            return {"success": False, "error": "Timeout waiting for response", "failed_step": 9}
-        
-        # Step 10: Copy Response
-        response = self.step10_copy_response()
-        if not response:
-            return {"success": False, "error": "Failed to copy response", "failed_step": 10}
-        
-        log_debug("=" * 60)
-        log_debug("FLOW COMPLETE - SUCCESS")
-        log_debug("=" * 60)
-        
-        return {
-            "success": True,
-            "response": response
-        }
+        # Block all mouse/keyboard input during the automation flow
+        # This prevents chaos from interfering with clicks and typing
+        with input_blocked():
+            log_phase(0, "execute_full_flow", "START")
+            log_debug("=" * 60)
+            log_debug("EXECUTING FULL FLOW")
+            log_debug(f"  Project: {project_name}")
+            log_debug(f"  Conversation: {conversation_name}")
+            log_debug(f"  Prompt: {prompt[:50]}...")
+            log_debug("=" * 60)
+            
+            # Step 1: Kill ChatGPT
+            log_phase(1, "kill_chatgpt", "START")
+            if not self.step1_kill_chatgpt():
+                log_phase(1, "kill_chatgpt", "FAIL")
+                return {"success": False, "error": "Failed to kill ChatGPT", "failed_step": 1}
+            log_phase(1, "kill_chatgpt", "OK")
+            
+            time.sleep(1.0)  # Extra wait after kill
+            
+            # Step 2: Start ChatGPT
+            log_phase(2, "start_chatgpt", "START")
+            if not self.step2_start_chatgpt():
+                log_phase(2, "start_chatgpt", "FAIL")
+                return {"success": False, "error": "Failed to start ChatGPT", "failed_step": 2}
+            log_phase(2, "start_chatgpt", "OK")
+            
+            # Step 3: Focus ChatGPT
+            log_phase(3, "focus_chatgpt", "START")
+            if not self.step3_focus_chatgpt():
+                log_phase(3, "focus_chatgpt", "FAIL")
+                return {"success": False, "error": "Failed to focus ChatGPT", "failed_step": 3}
+            log_phase(3, "focus_chatgpt", "OK")
+            
+            # Step 4: Open Sidebar
+            if not self.step4_open_sidebar():
+                return {"success": False, "error": "Failed to open sidebar", "failed_step": 4}
+            
+            # Step 5: Click Project
+            if not self.step5_click_project(project_name):
+                return {"success": False, "error": f"Failed to find project '{project_name}'", "failed_step": 5}
+            
+            time.sleep(0.5)  # Wait for project to expand
+            
+            # Step 6: Click Conversation - with retry from step 4 if needed
+            # (chaos might have closed sidebar or navigated away)
+            max_nav_retries = 2
+            for nav_attempt in range(max_nav_retries + 1):
+                if nav_attempt > 0:
+                    log_phase(6, "click_conversation", f"NAV_RETRY:{nav_attempt+1}")
+                    log_debug(f"[flow] Navigation failed, retrying from sidebar (attempt {nav_attempt + 1}/{max_nav_retries + 1})...")
+                    time.sleep(0.5)
+                    
+                    # Re-ensure foreground
+                    if not self._ensure_foreground():
+                        log_debug(f"[flow] ⚠ Could not ensure foreground for retry")
+                    
+                    # Re-open sidebar
+                    if not self.step4_open_sidebar():
+                        log_debug(f"[flow] ⚠ Could not re-open sidebar")
+                        continue
+                    
+                    # Re-click project
+                    if not self.step5_click_project(project_name):
+                        log_debug(f"[flow] ⚠ Could not re-click project")
+                        continue
+                    
+                    time.sleep(0.5)
+                
+                if self.step6_click_conversation(conversation_name):
+                    break  # Success!
+            else:
+                return {"success": False, "error": f"Failed to find conversation '{conversation_name}'", "failed_step": 6}
+            
+            # Response retry loop - handles case where chaos sent a new prompt
+            for response_attempt in range(max_response_retries + 1):
+                if response_attempt > 0:
+                    log_phase(7, "send_prompt", f"RESPONSE_RETRY:{response_attempt+1}")
+                    log_debug(f"[flow] Response invalid, retrying prompt (attempt {response_attempt + 1})")
+                    # Add a clarification to the prompt
+                    retry_prompt = f"Please ignore any messages above that don't match this format. Here is my actual question:\n\n{prompt}"
+                else:
+                    retry_prompt = prompt
+                
+                # Step 7+8: Focus & Send Prompt
+                if not self.step7_send_prompt(retry_prompt):
+                    return {"success": False, "error": "Failed to focus/send prompt", "failed_step": 7}
+                
+                # Step 9: Wait for Response
+                if not self.step9_wait_for_response():
+                    return {"success": False, "error": "Timeout waiting for response", "failed_step": 9}
+                
+                # Step 10: Copy Response
+                response = self.step10_copy_response()
+                if not response:
+                    return {"success": False, "error": "Failed to copy response", "failed_step": 10}
+                
+                # Validate response looks like proper JSON
+                if self._is_valid_json_response(response):
+                    log_phase(0, "execute_full_flow", "COMPLETE")
+                    log_debug("=" * 60)
+                    log_debug("FLOW COMPLETE - SUCCESS")
+                    log_debug("=" * 60)
+                    
+                    return {
+                        "success": True,
+                        "response": response
+                    }
+                else:
+                    log_phase(10, "copy_response", "INVALID_JSON")
+                    log_debug(f"[flow] Response looks like trash, will retry...")
+                    log_debug(f"[flow] Got: {response[:100]}...")
+            
+            # All retries exhausted
+            log_phase(0, "execute_full_flow", "FAIL:response_validation")
+            return {
+                "success": False, 
+                "error": f"Response validation failed after {max_response_retries + 1} attempts. Last response: {response[:100]}",
+                "failed_step": 10
+            }
 
 
 # Test
