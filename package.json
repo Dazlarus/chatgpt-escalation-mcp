@@ -46,8 +46,10 @@
   },
   "files": [
     "dist",
-    "config",
-    "drivers",
-    "README.md"
+    "src/drivers",
+    "src/backends",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
   ]
 }
