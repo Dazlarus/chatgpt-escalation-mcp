@@ -666,4 +666,58 @@ See [CHANGELOG.md](CHANGELOG.md) for version history.
 
 - Protocol probe usage and troubleshooting: `docs/protocol-probe.md`
 - Sidebar selection internals and tuning: `docs/sidebar-selection.md`
+- Safety guardrails and interruption recovery: `docs/safety-guardrails.md`
+
+## Chaos / Antagonistic Testing
+
+Test safety guardrails by running commands under an antagonist that randomly steals focus, minimizes ChatGPT, moves/clicks the mouse, opens occluding windows, and scrolls.
+
+**Quick commands:**
+
+```pwsh
+# Run any command with chaos (60s, medium intensity)
+npm run chaos -- <your-command>
+
+# Run protocol probe with aggressive chaos (90s)
+npm run chaos:probe
+
+# Run full escalation test under chaos (90s, aggressive)
+npm run chaos:escalate
+```
+
+**Customize chaos parameters:**
+
+```pwsh
+# Gentle chaos for 120 seconds
+node tools/with_antagonist.js --duration=120 --intensity=gentle -- npm run probe
+
+# Custom duration and intensity for escalation test
+node tools/chaos_escalation_test.js --duration=60 --intensity=medium
+```
+
+**Intensities:**
+- `gentle`: Fewer disruptions, longer delays between actions
+- `medium`: Balanced (default)
+- `aggressive`: Heavy focus stealing, frequent minimize/occlude
+
+**What the antagonist does:**
+- Random mouse moves and clicks
+- Steals focus to Notepad
+- Opens Notepad windows on top of ChatGPT
+- Minimizes ChatGPT window
+- Random scroll events
+
+**Note:** This intentionally disrupts your desktop session. Run on non-critical environments or VMs.
+
+**Chaos escalation test (`npm run chaos:escalate`):**
+
+Runs a full end-to-end test:
+1. Starts antagonist (default 90s, aggressive)
+2. Connects to MCP server
+3. Lists projects
+4. Calls `escalate_to_expert` with a test question
+5. Validates response
+6. Reports pass/fail
+
+This verifies that safety guardrails successfully recover from interruptions during a real escalation flow.
 

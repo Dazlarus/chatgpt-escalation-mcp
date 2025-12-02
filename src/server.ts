@@ -235,10 +235,14 @@ export async function createServer(): Promise<Server> {
         ],
       };
     } catch (error) {
-      logger.error("Escalation failed", { error });
-
       const errorMessage =
         error instanceof Error ? error.message : String(error);
+      const errorStack = error instanceof Error ? error.stack : undefined;
+      
+      logger.error("Escalation failed", { 
+        message: errorMessage,
+        stack: errorStack,
+      });
 
       return {
         content: [
