@@ -1,5 +1,7 @@
 # ChatGPT Escalation MCP Server
 
+Windows executable matching and restart behavior are being hardened for same-named unified ChatGPT/Codex processes. See [application identity configuration and validation](docs/WINDOWS-APP-IDENTITY.md). Unified-app UI compatibility remains unverified.
+
 An MCP (Model Context Protocol) server that enables autonomous coding agents to escalate complex questions to the ChatGPT Desktop app automatically — **ToS-compliant** via native UI automation.
 
 **What this does:** This tool lets autonomous coding agents (Copilot, Claude, Cline, Roo, etc.) escalate hard questions to the *ChatGPT Desktop app* on your computer. It automates ChatGPT the same way a human would — clicking the UI, sending the question, waiting for the response, copying it — then returns the answer to your agent so it can continue working *without you*.
@@ -51,8 +53,8 @@ An MCP (Model Context Protocol) server that enables autonomous coding agents to 
 
 ### Automation Flow
 
-1. **Kill ChatGPT** - Ensures clean state
-2. **Open ChatGPT** - Fresh start
+1. **Prepare App** - Reuse the verified running window; restart only when explicitly configured
+2. **Open ChatGPT** - Launch the configured executable when no verified window is running
 3. **Focus Window** - Bring to foreground
 4. **Open Sidebar** - Click hamburger menu (pixel detection for state)
 5. **Click Project** - OCR + fuzzy matching to find folder
@@ -62,7 +64,7 @@ An MCP (Model Context Protocol) server that enables autonomous coding agents to 
 9. **Wait for Response** - Pixel-based stop button detection
 10. **Copy Response** - Robust button probing to find copy button
 
-**Automatic Retry Logic**: If any step fails, the entire flow restarts (up to 4 attempts total). Each retry gets a fresh ChatGPT instance. Most failures are transient (focus lost, window minimized) and succeed on retry.
+**Automatic Retry Logic**: If any step fails, the entire flow restarts (up to 4 attempts total). By default each retry reuses the verified running window; the app itself is restarted only when both `restartTarget: true` and an explicit `executablePath` are configured, and the unified `OpenAI.Codex_*` app is never restarted. Most failures are transient (focus lost, window minimized) and succeed on retry.
 
 ## System Requirements
 
